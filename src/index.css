@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-zinc-950 text-zinc-100 antialiased;
+}
+
+.card {
+  @apply rounded-xl border border-zinc-800 bg-gradient-to-b from-zinc-900/80 to-zinc-950;
+}
+
+/* Native range inputs, gold-accented */
+input[type="range"] {
+  @apply w-full h-1.5 rounded-full appearance-none bg-zinc-800 cursor-pointer;
+  accent-color: #d4af37;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  @apply h-3.5 w-3.5 rounded-full;
+  background: #d4af37;
+}
+input[type="range"]::-moz-range-thumb {
+  @apply h-3.5 w-3.5 rounded-full border-0;
+  background: #d4af37;
+}
