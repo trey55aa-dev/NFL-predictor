@@ -4,6 +4,7 @@ import {
   EMPTY_INPUT,
   computeEloRatings,
   computeFlowStats,
+  computeYardageRanks,
   ensureWeights,
   normalizeAbbr,
   gradeGame,
@@ -15,10 +16,17 @@ import {
   parseTeamStatistics,
   predictGame,
   pythagoreanWinPct,
+  specialTeamsScore,
   styleProfile,
+  turnoverMarginPace,
+  turnoverMarginScore,
+  usageShiftEdge,
+  yardageRankScore,
   type Game,
   type GameContext,
   type StatsMap,
+  type TeamDetailStats,
+  type TeamInjuryReport,
   type TeamSeasonStats,
 } from "@/lib/predictor";
 
@@ -92,7 +100,7 @@ describe("predictGame", () => {
     expect(p.confidence).toBeGreaterThanOrEqual(0.5);
   });
 
-  it("reports per-factor contributions for all thirteen factors", () => {
+  it("reports per-factor contributions for all nineteen factors", () => {
     const p = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS, EMPTY_INPUT);
     expect(p.contributions.map((c) => c.label)).toEqual([
       "Record",
@@ -107,6 +115,12 @@ describe("predictGame", () => {
       "Game flow",
       "Injuries",
       "Style matchup",
+      "Usage shift",
+      "3rd down %",
+      "4th down %",
+      "Turnover margin",
+      "Yardage rank",
+      "Special teams",
       "Your reasoning",
     ]);
   });
@@ -204,6 +218,93 @@ describe("predictGame", () => {
     const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
     const withFlow = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
     expect(withFlow.homeProb).toBeGreaterThan(base.homeProb);
+  });
+
+  it("favors the team that wins 3rd/4th down and the turnover battle", () => {
+    const ctx: GameContext = {
+      ...evenCtx(),
+      detail: {
+        "1": {
+          teamId: "1",
+          passYpg: null,
+          rushYpg: null,
+          totalYpg: null,
+          thirdDownPct: 48,
+          fourthDownPct: 70,
+          takeawaysTotal: 22,
+          giveawaysTotal: 8,
+        },
+        "2": {
+          teamId: "2",
+          passYpg: null,
+          rushYpg: null,
+          totalYpg: null,
+          thirdDownPct: 34,
+          fourthDownPct: 40,
+          takeawaysTotal: 9,
+          giveawaysTotal: 18,
+        },
+      },
+    };
+    const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
+    const withSituational = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
+    expect(withSituational.homeProb).toBeGreaterThan(base.homeProb);
+    const labels = ["3rd down %", "4th down %", "Turnover margin"];
+    for (const label of labels) {
+      const c = withSituational.contributions.find((x) => x.label === label)!;
+      expect(c.value).toBeGreaterThan(0);
+    }
+  });
+
+  it("docks a run-heavy home team whose starting RB is ruled out", () => {
+    const ctx: GameContext = {
+      ...evenCtx(),
+      detail: {
+        "1": { teamId: "1", passYpg: 100, rushYpg: 160, totalYpg: 260 }, // run-heavy
+        "2": { teamId: "2", passYpg: 100, rushYpg: 160, totalYpg: 260 },
+      },
+      injuries: {
+        "1": {
+          teamId: "1",
+          burden: 5,
+          players: [{ name: "Star RB", position: "RB", status: "Out" }],
+        },
+      },
+    };
+    const base = predictGame(matchup, { ...evenCtx(), detail: ctx.detail }, DEFAULT_WEIGHTS);
+    const hurt = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
+    expect(hurt.homeProb).toBeLessThan(base.homeProb);
+  });
+
+  it("favors the team ranked top-5 in both offense and defense yardage", () => {
+    const ctx: GameContext = {
+      ...evenCtx(),
+      yardageRanks: { "1": { offRank: 3, defRank: 4 }, "2": { offRank: 20, defRank: 22 } },
+    };
+    const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
+    const withRank = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
+    expect(withRank.homeProb).toBeGreaterThan(base.homeProb);
+  });
+
+  it("rewards elite special-teams production including a return touchdown", () => {
+    const ctx: GameContext = {
+      ...evenCtx(),
+      detail: {
+        "1": {
+          teamId: "1",
+          passYpg: null,
+          rushYpg: null,
+          totalYpg: null,
+          puntReturnAvg: 14,
+          kickReturnAvg: 28,
+          specialTeamsTDs: 1,
+        },
+        "2": { teamId: "2", passYpg: null, rushYpg: null, totalYpg: null },
+      },
+    };
+    const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
+    const withST = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
+    expect(withST.homeProb).toBeGreaterThan(base.homeProb);
   });
 });
 
@@ -342,6 +443,249 @@ describe("parseTeamStatistics", () => {
   it("returns nulls on unknown shapes", () => {
     const d = parseTeamStatistics("12", { some: "other shape" });
     expect(d.totalYpg).toBeNull();
+  });
+
+  it("extracts 3rd/4th down %, defense yards allowed, and return production", () => {
+    const d = parseTeamStatistics("12", {
+      splits: {
+        categories: [
+          {
+            name: "miscellaneous",
+            stats: [
+              { name: "thirdDownConvPct", value: 44.5 },
+              { name: "fourthDownConvPct", value: 60.0 },
+            ],
+          },
+          {
+            name: "defensive",
+            stats: [{ name: "yardsAllowedPerGame", value: 305.4 }],
+          },
+          {
+            name: "returning",
+            stats: [
+              { name: "puntReturnAverage", value: 11.2 },
+              { name: "kickReturnAverage", value: 24.8 },
+              { name: "puntReturnTouchdowns", value: 1 },
+              { name: "kickReturnTouchdowns", value: 0 },
+            ],
+          },
+        ],
+      },
+    });
+    expect(d.thirdDownPct).toBe(44.5);
+    expect(d.fourthDownPct).toBe(60.0);
+    expect(d.defYpg).toBe(305.4);
+    expect(d.puntReturnAvg).toBe(11.2);
+    expect(d.kickReturnAvg).toBe(24.8);
+    expect(d.specialTeamsTDs).toBe(1);
+  });
+
+  it("keeps defensive takeaways separate from offensive giveaways using category context", () => {
+    const d = parseTeamStatistics("12", {
+      splits: {
+        categories: [
+          { name: "passing", stats: [{ name: "interceptions", value: 9 }] }, // thrown
+          { name: "rushing", stats: [{ name: "fumblesLost", value: 4 }] },
+          {
+            name: "defensive",
+            stats: [
+              { name: "interceptions", value: 15 }, // picked off
+              { name: "fumblesRecovered", value: 6 },
+            ],
+          },
+        ],
+      },
+    });
+    expect(d.giveawaysTotal).toBe(13); // 9 thrown + 4 lost
+    expect(d.takeawaysTotal).toBe(21); // 15 picks + 6 recoveries
+  });
+
+  it("computes return averages from yards/attempts when no average field is published", () => {
+    const d = parseTeamStatistics("12", {
+      splits: {
+        categories: [
+          {
+            name: "returning",
+            stats: [
+              { name: "puntReturns", value: 20 },
+              { name: "puntReturnYards", value: 240 },
+              { name: "kickReturns", value: 25 },
+              { name: "kickReturnYards", value: 575 },
+            ],
+          },
+        ],
+      },
+    });
+    expect(d.puntReturnAvg).toBe(12);
+    expect(d.kickReturnAvg).toBe(23);
+  });
+
+  it("falls back to a published turnover differential when takeaway/giveaway splits are absent", () => {
+    const dPositive = parseTeamStatistics("12", {
+      splits: { categories: [{ name: "miscellaneous", stats: [{ name: "turnOverDifferential", value: 8 }] }] },
+    });
+    expect(dPositive.takeawaysTotal).toBe(8);
+    expect(dPositive.giveawaysTotal).toBe(0);
+    const dNegative = parseTeamStatistics("12", {
+      splits: { categories: [{ name: "miscellaneous", stats: [{ name: "turnOverDifferential", value: -3 }] }] },
+    });
+    expect(dNegative.takeawaysTotal).toBe(0);
+    expect(dNegative.giveawaysTotal).toBe(3);
+  });
+});
+
+describe("turnoverMarginPace + turnoverMarginScore", () => {
+  it("weights forced takeaways above avoided giveaways in the margin", () => {
+    // Same raw differential (10 takeaways, 5 giveaways = +5), but the
+    // takeaway weight (1.2x) means this scores above a plain +5.
+    const pace = turnoverMarginPace(10, 5, 16); // 16 games played, 17-game pace
+    const plainMargin = ((10 - 5) / 16) * 17; // = 5.3125
+    expect(pace).toBeGreaterThan(plainMargin);
+  });
+
+  it("returns 0 margin for an even takeaway/giveaway split", () => {
+    expect(turnoverMarginPace(8, 8, 16)).toBeCloseTo((8 * 0.2 / 16) * 17, 5); // small positive from the weighting
+    expect(turnoverMarginScore(0)).toBe(0);
+  });
+
+  it("handles zero games played without dividing by zero", () => {
+    expect(turnoverMarginPace(0, 0, 0)).toBe(0);
+  });
+
+  it("scores tiers roughly as good / great / exceptional with diminishing returns above +10", () => {
+    const good = turnoverMarginScore(5);
+    const great = turnoverMarginScore(10);
+    const exceptional = turnoverMarginScore(20);
+    expect(good).toBeGreaterThan(0.4);
+    expect(good).toBeLessThan(0.6);
+    expect(great).toBeGreaterThan(0.7);
+    expect(great).toBeLessThan(0.85);
+    expect(exceptional).toBeGreaterThan(great);
+    // Diminishing returns: the jump from +10 to +20 is smaller than +0 to +10.
+    expect(exceptional - great).toBeLessThan(great);
+  });
+
+  it("is symmetric for a negative (giveaway-prone) margin", () => {
+    expect(turnoverMarginScore(-10)).toBeCloseTo(-turnoverMarginScore(10), 10);
+  });
+});
+
+describe("computeYardageRanks + yardageRankScore", () => {
+  function mkDetail(id: string, totalYpg: number, defYpg: number): TeamDetailStats {
+    return { teamId: id, passYpg: null, rushYpg: null, totalYpg, defYpg };
+  }
+
+  it("ranks offense by most total yards and defense by fewest yards allowed", () => {
+    const detail = {
+      "1": mkDetail("1", 400, 280), // best offense, best defense
+      "2": mkDetail("2", 300, 380), // worst offense, worst defense
+      "3": mkDetail("3", 350, 330),
+    };
+    const ranks = computeYardageRanks(detail);
+    expect(ranks["1"]).toEqual({ offRank: 1, defRank: 1 });
+    expect(ranks["2"]).toEqual({ offRank: 3, defRank: 3 });
+    expect(ranks["3"]).toEqual({ offRank: 2, defRank: 2 });
+  });
+
+  it("skips teams missing one side of the data rather than crashing", () => {
+    const detail = { "1": { teamId: "1", passYpg: null, rushYpg: null, totalYpg: 400, defYpg: null } };
+    const ranks = computeYardageRanks(detail);
+    expect(ranks["1"].offRank).toBe(1);
+    expect(ranks["1"].defRank).toBeNull();
+  });
+
+  it("gives a top-5-both bonus beyond the linear rank credit", () => {
+    const top5Both = yardageRankScore({ offRank: 3, defRank: 4 });
+    const top5OffOnly = yardageRankScore({ offRank: 3, defRank: 20 });
+    // Same offense rank, but top5Both should beat top5OffOnly by more than
+    // just the defense-rank swing — the explicit bonus kicks in.
+    const defRankOnlySwing = clampDiff(4, 20);
+    expect(top5Both - top5OffOnly).toBeGreaterThan(defRankOnlySwing);
+  });
+
+  it("returns 0 for an unranked team", () => {
+    expect(yardageRankScore(undefined)).toBe(0);
+    expect(yardageRankScore({ offRank: null, defRank: null })).toBe(0);
+  });
+
+  function clampDiff(a: number, b: number) {
+    const score = (r: number) => Math.min(0.5, Math.max(-0.5, (16 - r) / 16));
+    return score(a) - score(b);
+  }
+});
+
+describe("usageShiftEdge", () => {
+  const runHeavy = { offense: "Run-heavy" as const, offenseTier: null, defenseTier: null };
+  const passHeavy = { offense: "Pass-heavy" as const, offenseTier: null, defenseTier: null };
+
+  function mkInjuries(players: TeamInjuryReport["players"]): TeamInjuryReport {
+    return { teamId: "1", burden: 0, players };
+  }
+
+  it("penalizes a run-heavy team more than a pass-heavy one for the same hurt RB", () => {
+    const players = [{ name: "Star RB", position: "RB", status: "Out" }];
+    const runPenalty = usageShiftEdge(mkInjuries(players), runHeavy);
+    const passPenalty = usageShiftEdge(mkInjuries(players), passHeavy);
+    expect(runPenalty).toBeLessThan(passPenalty); // more negative
+    expect(runPenalty).toBeLessThan(0);
+  });
+
+  it("applies a smaller penalty for doubtful than for out/IR", () => {
+    const out = usageShiftEdge(mkInjuries([{ name: "RB", position: "RB", status: "Out" }]), runHeavy);
+    const doubtful = usageShiftEdge(
+      mkInjuries([{ name: "RB", position: "RB", status: "Doubtful" }]),
+      runHeavy,
+    );
+    expect(doubtful).toBeGreaterThan(out); // less negative
+  });
+
+  it("ignores non-RB injuries and questionable/probable statuses", () => {
+    expect(usageShiftEdge(mkInjuries([{ name: "WR", position: "WR", status: "Out" }]), runHeavy)).toBe(0);
+    expect(
+      usageShiftEdge(mkInjuries([{ name: "RB", position: "RB", status: "Questionable" }]), runHeavy),
+    ).toBe(0);
+  });
+
+  it("returns 0 with no injury report", () => {
+    expect(usageShiftEdge(undefined, runHeavy)).toBe(0);
+  });
+});
+
+describe("specialTeamsScore", () => {
+  it("credits a great punt-return average (+10 to +15) and kick return past the 25", () => {
+    const great = specialTeamsScore({
+      teamId: "1",
+      passYpg: null,
+      rushYpg: null,
+      totalYpg: null,
+      puntReturnAvg: 13,
+      kickReturnAvg: 27,
+    });
+    const average = specialTeamsScore({
+      teamId: "1",
+      passYpg: null,
+      rushYpg: null,
+      totalYpg: null,
+      puntReturnAvg: 8,
+      kickReturnAvg: 21,
+    });
+    expect(great).toBeGreaterThan(average);
+    expect(average).toBeCloseTo(0, 5);
+  });
+
+  it("treats a return touchdown as a large momentum bonus", () => {
+    const withTd = specialTeamsScore({
+      teamId: "1",
+      passYpg: null,
+      rushYpg: null,
+      totalYpg: null,
+      specialTeamsTDs: 1,
+    });
+    expect(withTd).toBeGreaterThan(0.3);
+  });
+
+  it("returns 0 with no detail", () => {
+    expect(specialTeamsScore(undefined)).toBe(0);
   });
 });
 

@@ -87,6 +87,22 @@ export interface TeamDetailStats {
   passYpg: number | null;
   rushYpg: number | null;
   totalYpg: number | null;
+  /** Total yards allowed per game (defense). */
+  defYpg?: number | null;
+  /** Offensive 3rd/4th down conversion rate, as a percent (e.g. 41.2). */
+  thirdDownPct?: number | null;
+  fourthDownPct?: number | null;
+  /** Season totals: defensive takeaways (INTs + fumble recoveries) and
+   *  offensive giveaways (INTs thrown + fumbles lost). Divide by the
+   *  team's gamesPlayed (from TeamSeasonStats) for a per-game/pace rate. */
+  takeawaysTotal?: number | null;
+  giveawaysTotal?: number | null;
+  /** Yards per punt/kick return, and season total return touchdowns
+   *  (punt/kick/blocked-kick — the "huge momentum shift" special-teams
+   *  plays). */
+  puntReturnAvg?: number | null;
+  kickReturnAvg?: number | null;
+  specialTeamsTDs?: number | null;
 }
 
 export type DetailMap = Record<string, TeamDetailStats>;
@@ -160,6 +176,10 @@ export interface GameContext {
   elo?: Record<string, number>;
   /** Advanced-source stats (EPA, QB metrics, nfelo), by team abbreviation. */
   advanced?: AdvancedMap;
+  /** League-wide yardage ranks. Compute with computeYardageRanks() over
+   *  every team's detail you have — ranking only this week's participants
+   *  understates/overstates rank versus the full 32-team league. */
+  yardageRanks?: Record<string, YardageRank>;
 }
 
 /** User-tunable factor weights, each 0–100. */
@@ -184,6 +204,23 @@ export interface ModelWeights {
   epa: number;
   /** Primary-QB advanced metrics (CPOE, from Next Gen Stats). */
   qbMetrics: number;
+  /** Game-plan shift when a starter (esp. RB) is out: pass-rate goes up,
+   *  backup-RB efficiency discount kicks in. */
+  usageShift: number;
+  /** 3rd down conversion % differential. */
+  thirdDown: number;
+  /** 4th down conversion % differential — the most critical situational
+   *  down, so its default weight sits above 3rd down's. */
+  fourthDown: number;
+  /** Turnover margin: tiered (+5 good, +10 great, 10+ exceptional) and
+   *  weighted so defense-forced takeaways count for more than offense
+   *  avoiding giveaways. */
+  turnoverMargin: number;
+  /** League-wide yardage rank; top-5 in both offense and defense is a
+   *  distinct, extra-credited signal. */
+  yardageRank: number;
+  /** Punt/kick return production and return touchdowns (momentum). */
+  specialTeams: number;
   /** How much the user's own lean + tags count. */
   reasoning: number;
 }
@@ -201,6 +238,12 @@ export const DEFAULT_WEIGHTS: ModelWeights = {
   powerRating: 70,
   epa: 60,
   qbMetrics: 50,
+  usageShift: 45,
+  thirdDown: 45,
+  fourthDown: 60,
+  turnoverMargin: 65,
+  yardageRank: 40,
+  specialTeams: 35,
   reasoning: 80,
 };
 
@@ -315,6 +358,120 @@ function offenseVsDefense(off: StyleProfile, def: StyleProfile): number {
   if (off.offenseTier === "Explosive") v += 0.15;
   if (off.offenseTier === "Grinding") v -= 0.1;
   return v;
+}
+
+/* ─── Turnover margin: tiered, defense-forced weighted ────────────────── */
+
+/**
+ * Takeaways (defense forcing turnovers) count for more than giveaways
+ * (offense simply not turning it over) — forcing the ball loose is the
+ * scarcer, more repeatable skill. Applied before the tiered curve below.
+ */
+const TAKEAWAY_WEIGHT = 1.2;
+const GIVEAWAY_WEIGHT = 1.0;
+
+/**
+ * Season-to-date turnover margin, prorated to a 17-game pace so a small
+ * early-season sample isn't mistaken for a huge one, weighted so forced
+ * takeaways count more than avoided giveaways.
+ */
+export function turnoverMarginPace(
+  takeawaysTotal: number,
+  giveawaysTotal: number,
+  gamesPlayed: number,
+): number {
+  if (gamesPlayed <= 0) return 0;
+  const weighted = takeawaysTotal * TAKEAWAY_WEIGHT - giveawaysTotal * GIVEAWAY_WEIGHT;
+  return (weighted / gamesPlayed) * 17;
+}
+
+/**
+ * Tiered scoring curve: 0 at even, ~0.5 at a +5 pace ("good"), ~0.76 at
+ * +10 ("great"), then diminishing returns above +10 ("exceptional" is a
+ * plateau, not an unbounded climb). Symmetric for a negative margin.
+ */
+export function turnoverMarginScore(marginPace: number): number {
+  return Math.sign(marginPace) * (1 - Math.exp(-Math.abs(marginPace) / 7));
+}
+
+/* ─── League-wide yardage rank ────────────────────────── */
+
+export interface YardageRank {
+  offRank: number | null;
+  defRank: number | null;
+}
+
+/**
+ * Rank every team in `detail` by total yards (offense: most is best) and
+ * yards allowed (defense: fewest is best). Ranking needs the *whole*
+ * league's numbers, not just this week's participants — pass in every
+ * team's detail you have, not only the teams playing this week.
+ */
+export function computeYardageRanks(detail: DetailMap): Record<string, YardageRank> {
+  const withOff = Object.values(detail).filter((d) => d.totalYpg != null);
+  const withDef = Object.values(detail).filter((d) => d.defYpg != null);
+  const offSorted = [...withOff].sort((x, y) => (y.totalYpg as number) - (x.totalYpg as number));
+  const defSorted = [...withDef].sort((x, y) => (x.defYpg as number) - (y.defYpg as number));
+  const offRank: Record<string, number> = {};
+  offSorted.forEach((d, i) => (offRank[d.teamId] = i + 1));
+  const defRank: Record<string, number> = {};
+  defSorted.forEach((d, i) => (defRank[d.teamId] = i + 1));
+  const out: Record<string, YardageRank> = {};
+  for (const teamId of new Set([...Object.keys(offRank), ...Object.keys(defRank)])) {
+    out[teamId] = { offRank: offRank[teamId] ?? null, defRank: defRank[teamId] ?? null };
+  }
+  return out;
+}
+
+/** Rank 1 → +0.5, rank 16 (mid-pack) → 0, rank 32 → -0.5, plus an explicit
+ *  bonus for landing top-5 in both — a distinct signal beyond "good stats". */
+export function yardageRankScore(rank: YardageRank | undefined): number {
+  if (!rank) return 0;
+  let score = 0;
+  if (rank.offRank != null) score += clamp((16 - rank.offRank) / 16, -0.5, 0.5);
+  if (rank.defRank != null) score += clamp((16 - rank.defRank) / 16, -0.5, 0.5);
+  if (rank.offRank != null && rank.offRank <= 5 && rank.defRank != null && rank.defRank <= 5) {
+    score += 0.3;
+  }
+  return score;
+}
+
+/* ─── Game-plan usage shift (injury-driven) ───────────── */
+
+const isSidelined = (status: string) => /out|reserve|\bir\b|doubtful/i.test(status);
+
+/**
+ * When a team's RB is out (or doubtful), the offense's plan shifts: pass
+ * volume goes up, and the backup RB is assumed less effective than the
+ * starter. The shift matters more for a team that already leans on the
+ * run (losing what you depend on hurts more than losing a complementary
+ * piece). Returns a same-team offense-strength adjustment — 0 or negative.
+ */
+export function usageShiftEdge(injuries: TeamInjuryReport | undefined, profile: StyleProfile): number {
+  if (!injuries) return 0;
+  const rbHurt = injuries.players.find((p) => p.position === "RB" && isSidelined(p.status));
+  if (!rbHurt) return 0;
+  const severity = /doubtful/i.test(rbHurt.status) ? 0.5 : 1;
+  const dependence =
+    profile.offense === "Run-heavy" ? 1 : profile.offense === "Balanced" ? 0.6 : 0.3;
+  return -severity * dependence * 0.5;
+}
+
+/* ─── Special teams ────────────────────────────────────── */
+
+/**
+ * Punt return average of +10 to +15 yd is great; kick returns that get the
+ * offense started past the 25 (approximated here by return average, since
+ * per-play starting field position isn't in the season stat feed) are
+ * great; a return touchdown is treated as a big momentum event on its own.
+ */
+export function specialTeamsScore(detail?: TeamDetailStats): number {
+  if (!detail) return 0;
+  let score = 0;
+  if (detail.puntReturnAvg != null) score += clamp((detail.puntReturnAvg - 8) / 7, -0.5, 0.5);
+  if (detail.kickReturnAvg != null) score += clamp((detail.kickReturnAvg - 21) / 6, -0.5, 0.5);
+  if (detail.specialTeamsTDs) score += Math.min(detail.specialTeamsTDs * 0.4, 0.6);
+  return score;
 }
 
 /* ─── Prediction engine (pure — unit tested) ──────────── */
@@ -443,6 +600,49 @@ export function predictGame(
   const aProf = styleProfile(ad, a);
   const styleEdge = offenseVsDefense(hProf, aProf) - offenseVsDefense(aProf, hProf);
   edge += add("Style matchup", styleEdge, weights.style);
+
+  // Game-plan usage shift: a hurt RB pushes the offense toward more
+  // passing and a less-effective run game, worse for teams that lean on
+  // the run in the first place.
+  const usageEdge = usageShiftEdge(hi, hProf) - usageShiftEdge(ai, aProf);
+  edge += add("Usage shift", usageEdge, weights.usageShift);
+
+  // 3rd / 4th down conversion rate — 4th down is the more critical
+  // situational down, reflected in its higher default weight.
+  const thirdEdge =
+    hd?.thirdDownPct != null && ad?.thirdDownPct != null ? (hd.thirdDownPct - ad.thirdDownPct) / 12 : 0;
+  edge += add("3rd down %", thirdEdge, weights.thirdDown);
+  const fourthEdge =
+    hd?.fourthDownPct != null && ad?.fourthDownPct != null
+      ? (hd.fourthDownPct - ad.fourthDownPct) / 15
+      : 0;
+  edge += add("4th down %", fourthEdge, weights.fourthDown);
+
+  // Turnover margin: tiered, and weighted so a defense forcing takeaways
+  // outweighs an offense simply not giving the ball away.
+  let toEdge = 0;
+  if (hd?.takeawaysTotal != null && hd?.giveawaysTotal != null && h?.gamesPlayed) {
+    toEdge += turnoverMarginScore(
+      turnoverMarginPace(hd.takeawaysTotal, hd.giveawaysTotal, h.gamesPlayed),
+    );
+  }
+  if (ad?.takeawaysTotal != null && ad?.giveawaysTotal != null && a?.gamesPlayed) {
+    toEdge -= turnoverMarginScore(
+      turnoverMarginPace(ad.takeawaysTotal, ad.giveawaysTotal, a.gamesPlayed),
+    );
+  }
+  edge += add("Turnover margin", toEdge, weights.turnoverMargin);
+
+  // League-wide yardage rank — top-5 in both offense and defense is a
+  // distinct signal, not just "good stats".
+  const rankEdge =
+    yardageRankScore(ctx.yardageRanks?.[game.home.id]) -
+    yardageRankScore(ctx.yardageRanks?.[game.away.id]);
+  edge += add("Yardage rank", rankEdge, weights.yardageRank);
+
+  // Special teams: return production plus the momentum jolt of a return TD.
+  const specialTeamsEdge = specialTeamsScore(hd) - specialTeamsScore(ad);
+  edge += add("Special teams", specialTeamsEdge, weights.specialTeams);
 
   // The user's reasoning layer: lean slider + environment tags.
   const tagSum = Object.values(input.tags).reduce(
@@ -633,21 +833,86 @@ export async function fetchStandings(season: number): Promise<StatsMap> {
 }
 
 /**
- * Parse a core-API team statistics payload into yardage detail.
- * Scans every category so shape drift degrades gracefully. Exported for tests.
+ * Parse a core-API team statistics payload into yardage + situational
+ * detail. Scans every category so shape drift degrades gracefully; a few
+ * fields (interceptions, fumbles) mean different things in a "defensive"
+ * category (takeaways) vs an offensive one (giveaways), so those are kept
+ * category-aware rather than folded into one flat lookup. Exported for
+ * tests.
  */
 export function parseTeamStatistics(teamId: string, data: any): TeamDetailStats {
   const idx: Record<string, number> = {};
+  let defInterceptions = 0;
+  let defFumbleRecoveries = 0;
+  let offInterceptionsThrown = 0;
+  let offFumblesLost = 0;
+  let turnoverDifferential: number | null = null;
+
   for (const cat of data?.splits?.categories ?? []) {
+    const catName = String(cat?.name ?? "").toLowerCase();
+    const isDefense = catName.includes("defensive") || catName.includes("defense");
     for (const s of cat?.stats ?? []) {
-      if (s?.name && typeof s.value === "number" && !(s.name in idx)) idx[s.name] = s.value;
+      if (!s?.name || typeof s.value !== "number") continue;
+      if (!(s.name in idx)) idx[s.name] = s.value;
+      if (s.name === "interceptions") {
+        if (isDefense) defInterceptions = s.value;
+        else offInterceptionsThrown = s.value;
+      } else if (s.name === "fumblesRecovered") {
+        defFumbleRecoveries = s.value;
+      } else if (s.name === "fumblesLost") {
+        offFumblesLost = s.value;
+      } else if (s.name === "turnOverDifferential" && turnoverDifferential == null) {
+        turnoverDifferential = s.value;
+      }
     }
   }
+
   const passYpg = idx.netPassingYardsPerGame ?? idx.passingYardsPerGame ?? null;
   const rushYpg = idx.rushingYardsPerGame ?? null;
   const totalYpg =
     idx.totalYardsPerGame ?? (passYpg != null && rushYpg != null ? passYpg + rushYpg : null);
-  return { teamId, passYpg, rushYpg, totalYpg };
+  const defYpg = idx.yardsAllowedPerGame ?? idx.totalYardsAllowedPerGame ?? null;
+  const thirdDownPct = idx.thirdDownConvPct ?? null;
+  const fourthDownPct = idx.fourthDownConvPct ?? null;
+
+  const takeawaysTotal =
+    defInterceptions || defFumbleRecoveries ? defInterceptions + defFumbleRecoveries : null;
+  const giveawaysTotal =
+    offInterceptionsThrown || offFumblesLost ? offInterceptionsThrown + offFumblesLost : null;
+  // Cross-check fallback: if we couldn't separate takeaways/giveaways but a
+  // direct differential stat is present, at least the margin math still
+  // works (turnoverMarginPace only needs the two numbers, so split it
+  // evenly around the published differential as a last resort).
+  const takeaways = takeawaysTotal ?? (turnoverDifferential != null ? Math.max(turnoverDifferential, 0) : null);
+  const giveaways = giveawaysTotal ?? (turnoverDifferential != null ? Math.max(-turnoverDifferential, 0) : null);
+
+  const puntReturns = idx.puntReturns ?? null;
+  const puntReturnYards = idx.puntReturnYards ?? null;
+  const puntReturnAvg =
+    idx.puntReturnAverage ??
+    (puntReturns && puntReturnYards != null ? puntReturnYards / puntReturns : null);
+  const kickReturns = idx.kickReturns ?? null;
+  const kickReturnYards = idx.kickReturnYards ?? null;
+  const kickReturnAvg =
+    idx.kickReturnAverage ??
+    (kickReturns && kickReturnYards != null ? kickReturnYards / kickReturns : null);
+  const specialTeamsTDs =
+    (idx.puntReturnTouchdowns ?? 0) + (idx.kickReturnTouchdowns ?? 0) || null;
+
+  return {
+    teamId,
+    passYpg,
+    rushYpg,
+    totalYpg,
+    defYpg,
+    thirdDownPct,
+    fourthDownPct,
+    takeawaysTotal: takeaways,
+    giveawaysTotal: giveaways,
+    puntReturnAvg,
+    kickReturnAvg,
+    specialTeamsTDs,
+  };
 }
 
 /** Fetch yardage detail for a set of teams; failures leave gaps, not errors. */

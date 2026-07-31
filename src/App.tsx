@@ -6,6 +6,7 @@ import {
   ENV_TAGS,
   NFL_INPUTS_KEY,
   NFL_WEIGHTS_KEY,
+  computeYardageRanks,
   ensureWeights,
   fetchDetailMap,
   fetchInjuries,
@@ -39,6 +40,12 @@ const WEIGHT_LABELS: { key: keyof ModelWeights; label: string; hint: string }[] 
   { key: "epa", label: "Efficiency (EPA)", hint: "Offensive EPA per game (nflverse)" },
   { key: "qbMetrics", label: "QB metrics", hint: "Primary QB CPOE (Next Gen Stats)" },
   { key: "yardage", label: "Yardage", hint: "Total yards per game" },
+  { key: "yardageRank", label: "Yardage rank", hint: "League rank; top-5 both ways is a bonus" },
+  { key: "thirdDown", label: "3rd down %", hint: "Conversion rate differential" },
+  { key: "fourthDown", label: "4th down %", hint: "Conversion rate — the most critical down" },
+  { key: "turnoverMargin", label: "Turnover margin", hint: "Tiered; takeaways count more than giveaways avoided" },
+  { key: "specialTeams", label: "Special teams", hint: "Return production + return-TD momentum" },
+  { key: "usageShift", label: "Usage shift", hint: "RB injury → pass-heavier game plan" },
   { key: "flow", label: "Game flow", hint: "1st/2nd-half surges from quarter scoring" },
   { key: "injuries", label: "Injuries", hint: "Injury-report burden, QB-weighted" },
   { key: "style", label: "Style matchup", hint: "Offense type vs defense type" },
@@ -573,6 +580,14 @@ export default function App() {
     retry: 1,
   });
 
+  // NOTE: ranks only this week's participants, not the full 32-team
+  // league, until detail is fetched for every team (tracked in
+  // PROGRESS.md) — a genuine approximation, not a full league rank yet.
+  const yardageRanks = useMemo(
+    () => (detail.data ? computeYardageRanks(detail.data) : undefined),
+    [detail.data],
+  );
+
   const ctx: GameContext = useMemo(
     () => ({
       stats: standings.data ?? {},
@@ -581,8 +596,9 @@ export default function App() {
       elo: history.data?.elo,
       injuries: injuries.data,
       advanced: advanced.data?.teams,
+      yardageRanks,
     }),
-    [standings.data, detail.data, history.data, injuries.data, advanced.data],
+    [standings.data, detail.data, history.data, injuries.data, advanced.data, yardageRanks],
   );
 
   const days = useMemo(() => groupByDay(games), [games]);
