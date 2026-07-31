@@ -17,6 +17,8 @@ import {
   predictGame,
   pythagoreanWinPct,
   specialTeamsScore,
+  situationalCategoryWinners,
+  situationalSweepBonus,
   styleProfile,
   turnoverMarginPace,
   turnoverMarginScore,
@@ -100,7 +102,7 @@ describe("predictGame", () => {
     expect(p.confidence).toBeGreaterThanOrEqual(0.5);
   });
 
-  it("reports per-factor contributions for all nineteen factors", () => {
+  it("reports per-factor contributions for all twenty factors", () => {
     const p = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS, EMPTY_INPUT);
     expect(p.contributions.map((c) => c.label)).toEqual([
       "Record",
@@ -121,6 +123,7 @@ describe("predictGame", () => {
       "Turnover margin",
       "Yardage rank",
       "Special teams",
+      "Situational sweep",
       "Your reasoning",
     ]);
   });
@@ -305,6 +308,39 @@ describe("predictGame", () => {
     const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
     const withST = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
     expect(withST.homeProb).toBeGreaterThan(base.homeProb);
+  });
+
+  it("gives an extra sweep bonus on top of the standalone factors when a team wins everything", () => {
+    const sweepDetail = {
+      "1": {
+        teamId: "1",
+        passYpg: 260,
+        rushYpg: 150,
+        totalYpg: 410,
+        thirdDownPct: 50,
+        takeawaysTotal: 22,
+        giveawaysTotal: 6,
+      },
+      "2": {
+        teamId: "2",
+        passYpg: 190,
+        rushYpg: 90,
+        totalYpg: 280,
+        thirdDownPct: 30,
+        takeawaysTotal: 6,
+        giveawaysTotal: 20,
+      },
+    };
+    // Zero out the sweep weight to isolate what the standalone factors
+    // alone produce, then compare against the full model.
+    const withoutSweep = predictGame(matchup, { ...evenCtx(), detail: sweepDetail }, {
+      ...DEFAULT_WEIGHTS,
+      situationalSweep: 0,
+    });
+    const withSweep = predictGame(matchup, { ...evenCtx(), detail: sweepDetail }, DEFAULT_WEIGHTS);
+    const sweepContribution = withSweep.contributions.find((c) => c.label === "Situational sweep")!;
+    expect(sweepContribution.value).toBeGreaterThan(0);
+    expect(withSweep.homeProb).toBeGreaterThan(withoutSweep.homeProb);
   });
 });
 
@@ -686,6 +722,89 @@ describe("specialTeamsScore", () => {
 
   it("returns 0 with no detail", () => {
     expect(specialTeamsScore(undefined)).toBe(0);
+  });
+});
+
+describe("situationalCategoryWinners", () => {
+  const h = mkStats("1", { gamesPlayed: 16 });
+  const a = mkStats("2", { gamesPlayed: 16 });
+
+  it("picks a winner per category from detail stats", () => {
+    const hd: TeamDetailStats = {
+      teamId: "1",
+      passYpg: 260,
+      rushYpg: 90,
+      totalYpg: 350,
+      thirdDownPct: 48,
+      takeawaysTotal: 20,
+      giveawaysTotal: 8,
+    };
+    const ad: TeamDetailStats = {
+      teamId: "2",
+      passYpg: 200,
+      rushYpg: 140,
+      totalYpg: 340,
+      thirdDownPct: 36,
+      takeawaysTotal: 10,
+      giveawaysTotal: 16,
+    };
+    const cats = situationalCategoryWinners(h, a, hd, ad);
+    expect(cats.thirdDown).toBe("home");
+    expect(cats.turnovers).toBe("home");
+    expect(cats.passing).toBe("home");
+    expect(cats.rushing).toBe("away");
+  });
+
+  it("returns null for a category missing data on either side, or a tie", () => {
+    const hd: TeamDetailStats = { teamId: "1", passYpg: null, rushYpg: 120, totalYpg: null, thirdDownPct: 40 };
+    const ad: TeamDetailStats = { teamId: "2", passYpg: 200, rushYpg: 120, totalYpg: null };
+    const cats = situationalCategoryWinners(h, a, hd, ad);
+    expect(cats.thirdDown).toBeNull(); // away has no thirdDownPct
+    expect(cats.passing).toBeNull(); // home has no passYpg
+    expect(cats.rushing).toBeNull(); // tied at 120
+    expect(cats.turnovers).toBeNull(); // neither side has takeaway/giveaway data
+  });
+});
+
+describe("situationalSweepBonus", () => {
+  it("gives the full bonus for a clean sweep of all four categories", () => {
+    const bonus = situationalSweepBonus({
+      thirdDown: "home",
+      turnovers: "home",
+      rushing: "home",
+      passing: "home",
+    });
+    expect(bonus).toBe(0.25);
+  });
+
+  it("gives a smaller bonus for winning all but one category", () => {
+    const bonus = situationalSweepBonus({
+      thirdDown: "home",
+      turnovers: "home",
+      rushing: "home",
+      passing: "away",
+    });
+    expect(bonus).toBeGreaterThan(0);
+    expect(bonus).toBeLessThan(0.25);
+  });
+
+  it("is negative (symmetric) when the away team sweeps", () => {
+    const bonus = situationalSweepBonus({
+      thirdDown: "away",
+      turnovers: "away",
+      rushing: "away",
+      passing: "away",
+    });
+    expect(bonus).toBe(-0.25);
+  });
+
+  it("gives no bonus for a split decision or too little data to judge", () => {
+    expect(
+      situationalSweepBonus({ thirdDown: "home", turnovers: "away", rushing: "home", passing: "away" }),
+    ).toBe(0);
+    expect(
+      situationalSweepBonus({ thirdDown: "home", turnovers: "home", rushing: null, passing: null }),
+    ).toBe(0); // only 2 of 4 categories known — not enough to call a sweep
   });
 });
 

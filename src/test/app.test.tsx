@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 // Mock the /api/advanced client with a canned response.
@@ -147,6 +147,10 @@ const standings = {
           standingsEntry("2", 10, 4, 400, 300),
           standingsEntry("24", 8, 6, 330, 320),
           standingsEntry("7", 8, 6, 340, 330),
+          // On a bye this week — no game in `scoreboard` above — used to
+          // verify detail is fetched league-wide, not just for teams
+          // playing this week.
+          standingsEntry("99", 6, 8, 300, 310),
         ],
       },
     },
@@ -218,6 +222,31 @@ describe("App", () => {
     expect(pickLabels).toHaveLength(3);
   });
 
+  it("fetches team detail for the whole league, including bye-week teams, not just this week's participants", async () => {
+    const fetchSpy = vi.fn(async (url: string) => {
+      const u = String(url);
+      const body = u.includes("/injuries")
+        ? injuries
+        : u.includes("/statistics")
+          ? teamStatistics
+          : u.includes("/standings")
+            ? standings
+            : scoreboard;
+      return { ok: true, json: async () => body };
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    mountPage();
+    await screen.findAllByText("Chiefs");
+    // Team "99" is on a bye (no game in the scoreboard fixture) but is in
+    // standings — its statistics should still be fetched so yardageRank
+    // covers the full league, not only teams playing this week.
+    await waitFor(() => {
+      const calledBye = fetchSpy.mock.calls.some((c) => String(c[0]).includes("/teams/99/statistics"));
+      expect(calledBye).toBe(true);
+    });
+  });
+
   it("shows a clock-priced live win probability for the 21-0 game", async () => {
     mountPage();
     expect(await screen.findByText("Live win probability")).toBeInTheDocument();
@@ -234,10 +263,15 @@ describe("App", () => {
     mountPage();
     // KC 11-3 favored at home over LV 5-9; final KC 27-17 → hit
     expect(await screen.findByText(/Hit/)).toBeInTheDocument();
-    expect(screen.getByText("All-time")).toBeInTheDocument();
-    expect(screen.getByText("1–0")).toBeInTheDocument();
-    const stored = JSON.parse(localStorage.getItem("nflp.gameInputs") ?? "{}");
-    expect(stored.final1.graded.correct).toBe(true);
+    expect(await screen.findByText("All-time")).toBeInTheDocument();
+    expect(await screen.findByText("1–0")).toBeInTheDocument();
+    // The grade lands in React state (driving the DOM above) and in
+    // localStorage via a separate effect in useLocalStorage — poll rather
+    // than assume both have settled in the same tick as the DOM text.
+    await waitFor(() => {
+      const stored = JSON.parse(localStorage.getItem("nflp.gameInputs") ?? "{}");
+      expect(stored.final1?.graded?.correct).toBe(true);
+    });
   });
 
   it("opens 'Your read' and assigns an environment tag to the home side", async () => {
@@ -299,6 +333,21 @@ describe("App", () => {
     // "Injuries" appears both as an environment tag and a factor row
     expect(screen.getAllByText("Injuries").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("Style matchup")).toBeInTheDocument();
+    expect(screen.getByText("3rd down %")).toBeInTheDocument();
+    expect(screen.getByText("4th down %")).toBeInTheDocument();
+    expect(screen.getByText("Turnover margin")).toBeInTheDocument();
+    expect(screen.getByText("Yardage rank")).toBeInTheDocument();
+    expect(screen.getByText("Situational sweep")).toBeInTheDocument();
     expect(screen.getByText("Your reasoning")).toBeInTheDocument();
+  });
+
+  it("shows the new situational weight sliders in the model weights panel", async () => {
+    mountPage();
+    await screen.findAllByText("Chiefs");
+    fireEvent.click(screen.getByText("Model weights"));
+    expect(screen.getByText("Situational sweep")).toBeInTheDocument();
+    expect(screen.getByText("Usage shift")).toBeInTheDocument();
+    expect(screen.getByText("3rd down %")).toBeInTheDocument();
+    expect(screen.getByText("4th down %")).toBeInTheDocument();
   });
 });

@@ -45,6 +45,7 @@ const WEIGHT_LABELS: { key: keyof ModelWeights; label: string; hint: string }[] 
   { key: "fourthDown", label: "4th down %", hint: "Conversion rate — the most critical down" },
   { key: "turnoverMargin", label: "Turnover margin", hint: "Tiered; takeaways count more than giveaways avoided" },
   { key: "specialTeams", label: "Special teams", hint: "Return production + return-TD momentum" },
+  { key: "situationalSweep", label: "Situational sweep", hint: "Bonus for winning nearly everything: 3rd down, turnovers, rushing, passing" },
   { key: "usageShift", label: "Usage shift", hint: "RB injury → pass-heavier game plan" },
   { key: "flow", label: "Game flow", hint: "1st/2nd-half surges from quarter scoring" },
   { key: "injuries", label: "Injuries", hint: "Injury-report burden, QB-weighted" },
@@ -540,10 +541,17 @@ export default function App() {
   });
 
   const games = useMemo(() => schedule.data?.games ?? [], [schedule.data]);
-  const teamIds = useMemo(
-    () => Array.from(new Set(games.flatMap((g) => [g.home.id, g.away.id]))).sort(),
-    [games],
-  );
+  // Prefer every team in the league (from standings, which always covers
+  // all 32 regardless of byes) so yardageRank reflects a true 1-32 rank
+  // rather than only ranking this week's ~8-16 participants. Standings
+  // loads slightly ahead of/alongside the schedule in practice, but fall
+  // back to just this week's teams so detail still populates before it
+  // resolves.
+  const teamIds = useMemo(() => {
+    const leagueIds = Object.keys(standings.data ?? {});
+    if (leagueIds.length > 0) return leagueIds.sort();
+    return Array.from(new Set(games.flatMap((g) => [g.home.id, g.away.id]))).sort();
+  }, [standings.data, games]);
 
   // Enrichment feeds — each optional; the model stays neutral where they fail.
   const detail = useQuery({

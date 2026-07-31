@@ -221,6 +221,10 @@ export interface ModelWeights {
   yardageRank: number;
   /** Punt/kick return production and return touchdowns (momentum). */
   specialTeams: number;
+  /** Bonus for sweeping (or nearly sweeping) 3rd down / turnovers /
+   *  rushing / passing — a distinct "wins everything" signal layered on
+   *  top of those standalone factors, not a re-count of them. */
+  situationalSweep: number;
   /** How much the user's own lean + tags count. */
   reasoning: number;
 }
@@ -244,6 +248,7 @@ export const DEFAULT_WEIGHTS: ModelWeights = {
   turnoverMargin: 65,
   yardageRank: 40,
   specialTeams: 35,
+  situationalSweep: 40,
   reasoning: 80,
 };
 
@@ -474,6 +479,76 @@ export function specialTeamsScore(detail?: TeamDetailStats): number {
   return score;
 }
 
+/* ─── Situational sweep (composite, not a re-count) ───── */
+
+export type CategoryWinner = "home" | "away" | null;
+
+export interface SituationalCategories {
+  thirdDown: CategoryWinner;
+  turnovers: CategoryWinner;
+  rushing: CategoryWinner;
+  passing: CategoryWinner;
+}
+
+/**
+ * Who wins each of the four situational categories the user called out:
+ * 3rd down %, turnover battle, rushing, passing. `null` when either side
+ * lacks the data to judge that category.
+ *
+ * Simplification (see PROGRESS.md): rushing/passing are compared on raw
+ * season yards/game — there's no run-rate adjustment for volume, no
+ * late-game weighting for "putting the game away" rushing, and no
+ * garbage-time discount for passing yards. Those all need play-by-play,
+ * game-state-tagged data we don't fetch yet. This gives a real (if blunt)
+ * signal now rather than waiting on that data pipeline.
+ */
+export function situationalCategoryWinners(
+  h: TeamSeasonStats | undefined,
+  a: TeamSeasonStats | undefined,
+  hd: TeamDetailStats | undefined,
+  ad: TeamDetailStats | undefined,
+): SituationalCategories {
+  const pick = (hv: number | null | undefined, av: number | null | undefined): CategoryWinner =>
+    hv == null || av == null || hv === av ? null : hv > av ? "home" : "away";
+
+  const turnovers =
+    h && a && hd?.takeawaysTotal != null && hd?.giveawaysTotal != null &&
+    ad?.takeawaysTotal != null && ad?.giveawaysTotal != null
+      ? pick(
+          turnoverMarginPace(hd.takeawaysTotal, hd.giveawaysTotal, h.gamesPlayed),
+          turnoverMarginPace(ad.takeawaysTotal, ad.giveawaysTotal, a.gamesPlayed),
+        )
+      : null;
+
+  return {
+    thirdDown: pick(hd?.thirdDownPct, ad?.thirdDownPct),
+    turnovers,
+    rushing: pick(hd?.rushYpg, ad?.rushYpg),
+    passing: pick(hd?.passYpg, ad?.passYpg),
+  };
+}
+
+/**
+ * A bonus/malus for sweeping — or nearly sweeping — the situational
+ * categories, layered *on top of* the standalone thirdDown/turnoverMargin/
+ * yardage factors rather than re-adding them, since those already score
+ * each category on its own. This only fires for the distinct "wins
+ * basically everything" signal: needs at least 3 of the 4 categories
+ * resolved before it says anything, and only kicks in for a full sweep or
+ * a "wins all but one" margin.
+ */
+export function situationalSweepBonus(cats: SituationalCategories): number {
+  const decided = Object.values(cats).filter((v): v is "home" | "away" => v !== null);
+  if (decided.length < 3) return 0;
+  const homeWins = decided.filter((v) => v === "home").length;
+  const awayWins = decided.length - homeWins;
+  if (homeWins === decided.length) return 0.25;
+  if (awayWins === decided.length) return -0.25;
+  if (homeWins > awayWins && homeWins >= decided.length - 1) return 0.12;
+  if (awayWins > homeWins && awayWins >= decided.length - 1) return -0.12;
+  return 0;
+}
+
 /* ─── Prediction engine (pure — unit tested) ──────────── */
 
 /**
@@ -643,6 +718,12 @@ export function predictGame(
   // Special teams: return production plus the momentum jolt of a return TD.
   const specialTeamsEdge = specialTeamsScore(hd) - specialTeamsScore(ad);
   edge += add("Special teams", specialTeamsEdge, weights.specialTeams);
+
+  // Situational sweep: a distinct bonus for winning (nearly) all of 3rd
+  // down / turnovers / rushing / passing, layered on top of those
+  // standalone factors rather than re-counting them.
+  const sweepEdge = situationalSweepBonus(situationalCategoryWinners(h, a, hd, ad));
+  edge += add("Situational sweep", sweepEdge, weights.situationalSweep);
 
   // The user's reasoning layer: lean slider + environment tags.
   const tagSum = Object.values(input.tags).reduce(

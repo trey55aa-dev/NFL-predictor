@@ -63,24 +63,38 @@ crunch season averages:
 - [x] `specialTeams` factor — punt/kick return averages (calibrated so a
       +13 punt-return avg and a 27-yard kick-return avg score near max) +
       return-TD bonus. 2026-07-31.
-- [ ] `situationalBattle` composite factor — explicit "how many of {3rd
-      down%, turnover battle, rushing, passing} does each team win" count,
-      with rushing run-rate-adjusted + late-game-weighted and passing
-      discounted in garbage time. **Deferred** — needs a design decision on
-      how to avoid double-counting against the standalone factors above
-      (see design notes below) plus play-by-play data for the late-game /
-      garbage-time splits, which we don't fetch yet.
+- [x] `situationalBattle` composite factor — built as `situationalSweep`:
+      a bonus/malus layered on top of the standalone factors (not a
+      re-count of them), scoring who wins 3+ of {3rd down%, turnover
+      margin, rushing ypg, passing ypg} — full sweep = ±0.25 edge, "all but
+      one" = ±0.12, anything less decisive = 0. Needs ≥3 of the 4
+      categories resolved before it says anything. 2026-07-31. **Known
+      simplification** (see design note below, now resolved): rushing/
+      passing are compared on raw season yards/game — no run-rate
+      adjustment for volume, no late-game weighting, no garbage-time
+      discount. Real versions of those need play-by-play/game-state data
+      we don't fetch. Revisit once that data exists; don't just widen this
+      factor's guesswork in the meantime.
 - [ ] Extend momentum/flow to treat special-teams TDs and takeaways as
       explicit in-game momentum events (currently `specialTeams` and
       `turnoverMargin` are season-long factors; the *in-game* momentum
       swing from a pick-six or punt-return TD isn't yet folded into
-      `liveWinProb` the way score/clock is).
+      `liveWinProb` the way score/clock is). **Scoped, not started:**
+      requires parsing ESPN's live competition `situation`/`scoringPlays`
+      feed (not currently fetched at all) to detect "a takeaway or return
+      TD just happened," then applying a short-lived probability bump on
+      top of the existing score/clock curve in `liveWinProb`, decaying
+      over the next drive or two. Don't fake this without that data source
+      — a momentum bump with no underlying event to trigger it is just
+      noise.
 - [x] Data: extend ESPN team-statistics parsing for 3rd/4th down%,
       turnovers (category-aware, offense vs defense), return yardage.
       2026-07-31.
-- [ ] Data: fetch detail for **every** league team (not just this week's
-      participants) so `yardageRank` reflects the true 1-32 rank, not a
-      rank among ~8-16 teams.
+- [x] Data: fetch detail for **every** league team (not just this week's
+      participants) — `teamIds` for the detail fetch now comes from
+      `standings.data` (which always covers all 32 teams, byes included)
+      instead of only the current week's game participants, so
+      `yardageRank` reflects a true 1-32 rank. 2026-07-31.
 - [ ] Data: weekly injury depth-chart context (who's QB1/RB1 vs QB2/RB2) —
       `usageShift` currently treats any sidelined RB as "the starter,"
       which overstates the hit when the injured player was already a
@@ -92,17 +106,31 @@ crunch season averages:
       once the core spec above is done; needs a persistence decision
       (see NOTES.md)
 
-### Design note: situationalBattle, next time up
+### Resolved design note: situationalBattle
 
-Don't just linearly add another factor for "wins 3rd down + turnovers +
-rushing + passing" — `thirdDown` and `turnoverMargin` already exist as
-standalone factors, so a naive composite double-counts them. Options to
-consider: (a) make `situationalBattle` a *multiplier/bonus* on top of the
-existing factors when a team sweeps 3+ of the 4 categories, rather than an
-additive edge of its own, or (b) fold rushing/passing context-adjustment
-in as refinements to the existing `yardage`/`production` factors instead of
-a new top-level factor. Pick one and document why before implementing —
-don't build both halfway.
+Went with option (a) from the original note: `situationalSweep` is a
+bonus/malus on top of the standalone `thirdDown`/`turnoverMargin`/`yardage`
+factors, not an additive re-count of them — it only activates for the
+distinct "wins basically everything" case (full sweep or all-but-one of
+the 4 categories), so it can't just be duplicating credit those factors
+already give for a narrow single-category edge. See
+`situationalSweepBonus`/`situationalCategoryWinners` in predictor.ts.
+
+### Found-during-this-cycle: a test-timing race, fixed
+
+`app.test.tsx`'s "grades the final game" test checked
+`localStorage.getItem(...)` synchronously right after a `getByText` match —
+that happened to work before this cycle's changes but broke once an extra
+render pass (from the `yardageRanks` memo) shifted timing enough to expose
+it: the DOM updates (via React state) one tick before the *separate*
+`useLocalStorage` persistence effect actually writes to `localStorage`.
+Root-caused by instrumenting the grading effect directly (see git history
+if this resurfaces) — confirmed grading itself was correct the whole time,
+it was purely a test assertion racing ahead of an unrelated effect. Fixed
+by wrapping the localStorage assertion in `waitFor` instead of asserting
+synchronously. If a future cycle sees similar "state says X but storage
+read says Y" flakiness, check this pattern first before assuming a logic
+bug.
 
 ## Notes
 
