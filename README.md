@@ -1,7 +1,8 @@
 # NFL Predictor
 
 A standalone website that projects NFL winners week by week from **your model
-and your reasoning** — no account, no backend database required.
+and your reasoning**. No database — your data lives in the browser, and an
+optional single-user login (see below) keeps the whole site to just you.
 
 ## What it does
 
@@ -65,3 +66,53 @@ locally, use `vercel dev` instead of `npm run dev`.
 Any other static host works too (Netlify, Cloudflare Pages) — port
 `api/advanced.ts` to that host's function format, or skip it and run on
 ESPN data + computed Elo.
+
+## Locking it to just you (real login, one account)
+
+The whole site sits behind a login screen once deployed — a real signed
+session (not just a client-side check), backed by a username + hashed
+password you set yourself. There's still no user database: your one
+account lives entirely in three Vercel environment variables.
+
+**1. Pick a username and password, then hash the password locally:**
+
+```bash
+node scripts/hash-password.mjs "your-chosen-password"
+```
+
+This prints a `salt:hash` string — copy it. Your plaintext password is
+never stored anywhere; only this hash is.
+
+**2. Set the three secrets on Vercel** (from this directory, after your
+first `vercel` deploy so the project exists):
+
+```bash
+vercel env add AUTH_USERNAME          # e.g. your name or email
+vercel env add AUTH_PASSWORD_HASH     # the salt:hash string from step 1
+vercel env add AUTH_SESSION_SECRET    # any long random string — e.g. output of:
+                                       #   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+**3. Redeploy** so the new env vars take effect:
+
+```bash
+vercel --prod
+```
+
+That's it — visiting the site now redirects to a sign-in page first.
+Sessions last 30 days; use the **Sign out** button in the app header to
+clear yours early (useful on a shared or public computer).
+
+**Notes:**
+- This only activates on a real Vercel deploy — Edge Middleware isn't
+  something plain `npm run dev` runs, so local testing stays login-free
+  by design.
+- Change your password anytime by re-running step 1 and updating
+  `AUTH_PASSWORD_HASH` (`vercel env rm AUTH_PASSWORD_HASH` then
+  `vercel env add AUTH_PASSWORD_HASH`), then redeploy.
+- If `AUTH_SESSION_SECRET` is missing, the site fails *closed* (a 500
+  page, not an open one) — a misconfigured deploy should be obviously
+  broken, never silently public.
+- Want this at your own domain instead of a `*.vercel.app` one? Add it
+  under the Vercel project's Settings → Domains — the login gate covers
+  whatever domain the deploy answers to, no extra config needed.

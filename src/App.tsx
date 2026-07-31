@@ -697,6 +697,19 @@ export default function App() {
               <button className={ghostBtn} onClick={() => fileRef.current?.click()}>
                 ⭱ Import data
               </button>
+              <button
+                className={ghostBtn}
+                onClick={() => {
+                  // /api/logout only exists on a real Vercel deploy; under
+                  // plain `vite dev` this 404s harmlessly and we still send
+                  // the browser to login.html (a static file either way).
+                  fetch("/api/logout", { method: "POST" }).finally(() => {
+                    window.location.href = "/login.html";
+                  });
+                }}
+              >
+                Sign out
+              </button>
               <input
                 ref={fileRef}
                 type="file"

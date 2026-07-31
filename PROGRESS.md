@@ -132,6 +132,37 @@ synchronously. If a future cycle sees similar "state says X but storage
 read says Y" flakiness, check this pattern first before assuming a logic
 bug.
 
+## Out-of-spec addition: single-user login (2026-07-31, direct request)
+
+Not part of the football model spec above — the user asked directly (in
+conversation, not via this file) for the deployed site to sit behind a
+real login so it's only reachable by them. Built as:
+
+- `middleware.ts` (Vercel Edge Middleware) gates every request behind a
+  signed session cookie, verified via `lib/session.ts` (HMAC-SHA256 over
+  Web Crypto, so the same code works in both the Edge middleware and the
+  Node.js login function).
+- `lib/password.ts` — scrypt hash/verify, no dependency.
+- `api/login.ts` / `api/logout.ts` — the only two routes middleware always
+  lets through (plus `/login.html`), so the login flow can never lock
+  itself out even if Vercel's `matcher` config isn't honored exactly as
+  expected (there's a redundant in-function path check for this).
+- `public/login.html` — a self-contained static login page (no JS/CSS
+  dependencies of its own, so it never needs to pass through the auth
+  gate to load its own assets).
+- `scripts/hash-password.mjs` — one-time CLI to turn a chosen password
+  into the `AUTH_PASSWORD_HASH` value; the plaintext password is never
+  stored anywhere.
+- Setup instructions are in README.md's "Locking it to just you" section.
+
+**Not verified against a live Vercel deploy** — this sandbox can't reach
+Vercel's infrastructure, so `middleware.ts`'s `config.matcher` behavior on
+the actual platform (as opposed to the unit-tested pure function logic)
+needs a real post-deploy check. If a login loop or lockout ever appears in
+production, start by checking whether the matcher regex is being honored
+the way Next.js's is, since that assumption is the one part of this that
+couldn't be tested here.
+
 ## Notes
 
 - GitHub push access to `trey55aa-dev/nfl-predictor` was not authorized as

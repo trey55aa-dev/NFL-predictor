@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>NFL Predictor — Sign in</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    background: #09090b;
+    color: #f4f4f5;
+    font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+  }
+  form {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+    padding: 32px;
+    width: 100%;
+    max-width: 320px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: #a1a1aa; font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase; margin: 0 0 20px; }
+  label { display: block; font-size: 12px; color: #a1a1aa; margin-bottom: 4px; }
+  input {
+    width: 100%;
+    background: #09090b;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #f4f4f5;
+    margin-bottom: 14px;
+    font-size: 14px;
+  }
+  input:focus { outline: none; border-color: #d4af37; }
+  button {
+    width: 100%;
+    background: #d4af37;
+    color: #09090b;
+    border: none;
+    border-radius: 6px;
+    padding: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  .error { color: #f87171; font-size: 12px; margin: 0 0 12px; min-height: 14px; }
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>NFL Predictor</h1>
+  <p class="sub">Sign in</p>
+  <div class="error" id="err"></div>
+  <label for="u">Username</label>
+  <input id="u" name="username" autocomplete="username" required />
+  <label for="p">Password</label>
+  <input id="p" name="password" type="password" autocomplete="current-password" required />
+  <button type="submit" id="btn">Sign in</button>
+</form>
+<script>
+  var f = document.getElementById("f");
+  var err = document.getElementById("err");
+  var btn = document.getElementById("btn");
+  f.addEventListener("submit", function (e) {
+    e.preventDefault();
+    err.textContent = "";
+    btn.disabled = true;
+    btn.textContent = "Signing in…";
+    fetch("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("u").value,
+        password: document.getElementById("p").value,
+      }),
+    })
+      .then(function (res) {
+        if (res.ok) {
+          window.location.href = "/";
+          return;
+        }
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          err.textContent = data.error || "Sign in failed.";
+        });
+      })
+      .catch(function () {
+        err.textContent = "Network error — try again.";
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "Sign in";
+      });
+  });
+</script>
+</body>
+</html>
