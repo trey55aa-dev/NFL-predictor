@@ -55,6 +55,24 @@ export interface Game {
   /** Live-game clock: current period and seconds left in it. */
   period?: number;
   clockSeconds?: number;
+  /** Scoring plays so far, for the in-game momentum bump — see
+   *  momentumBump(). Only fetched/populated for live games. */
+  scoringPlays?: ScoringPlay[];
+}
+
+/**
+ * One scoring play, enough to price its momentum: when it happened and
+ * whether it was an "explosive" defensive/special-teams score — a
+ * pick-six, a fumble/punt/kick return touchdown, a blocked-kick return —
+ * the plays that flip a building's momentum beyond their point value,
+ * as opposed to the tail end of an ordinary scoring drive.
+ */
+export interface ScoringPlay {
+  period: number;
+  /** Seconds remaining in that period when the play happened. */
+  clockSeconds: number;
+  team: "home" | "away";
+  explosive: boolean;
 }
 
 export interface WeekSchedule {
@@ -103,6 +121,8 @@ export interface TeamDetailStats {
   puntReturnAvg?: number | null;
   kickReturnAvg?: number | null;
   specialTeamsTDs?: number | null;
+  /** Time of possession, as a percent of the game (e.g. 52.3). */
+  possessionPct?: number | null;
 }
 
 export type DetailMap = Record<string, TeamDetailStats>;
@@ -126,6 +146,7 @@ export interface TeamFlowStats {
 export type FlowMap = Record<string, TeamFlowStats>;
 
 export interface InjuredPlayer {
+  id?: string;
   name: string;
   position: string;
   status: string;
@@ -139,6 +160,38 @@ export interface TeamInjuryReport {
 }
 
 export type InjuryMap = Record<string, TeamInjuryReport>;
+
+/**
+ * A team's roster, positioned so the "presumptive starter" at the two
+ * positions the model cares about (who takes the offense's identity with
+ * them if hurt) can be identified. ESPN's roster feed doesn't publish an
+ * official depth chart, so "starter" here is a heuristic: the
+ * first-listed player at that position group, which tracks the real
+ * depth chart on most rosters but isn't guaranteed — treat it as a
+ * reasonable default the user's own reasoning/notes can override, not
+ * ground truth.
+ */
+export interface RosterPlayer {
+  id: string;
+  name: string;
+  position: string;
+  /** Listed order within its position group — index 0 is the
+   *  presumptive starter. */
+  depthIndex: number;
+}
+
+export interface TeamRoster {
+  teamId: string;
+  players: RosterPlayer[];
+}
+
+export type RosterMap = Record<string, TeamRoster>;
+
+/** The presumptive starter (depthIndex 0) at a position, if on the roster. */
+export function presumptiveStarter(roster: TeamRoster | undefined, position: string): RosterPlayer | null {
+  if (!roster) return null;
+  return roster.players.find((p) => p.position === position && p.depthIndex === 0) ?? null;
+}
 
 /**
  * Advanced per-team stats served by the nfl-advanced-stats edge function,
@@ -172,6 +225,9 @@ export interface GameContext {
   detail?: DetailMap;
   flow?: FlowMap;
   injuries?: InjuryMap;
+  /** Rosters, used to tell whether an injured player was the presumptive
+   *  starter or a backup — see presumptiveStarter(). */
+  rosters?: RosterMap;
   /** Elo power ratings computed from this season's results, by team id. */
   elo?: Record<string, number>;
   /** Advanced-source stats (EPA, QB metrics, nfelo), by team abbreviation. */
@@ -225,6 +281,10 @@ export interface ModelWeights {
    *  rushing / passing — a distinct "wins everything" signal layered on
    *  top of those standalone factors, not a re-count of them. */
   situationalSweep: number;
+  /** Time-of-possession quality: control matters, but only paired with
+   *  the ability to score; a team with less possession time needs
+   *  scoring efficiency and clutch defensive stops to compensate. */
+  possession: number;
   /** How much the user's own lean + tags count. */
   reasoning: number;
 }
@@ -249,6 +309,7 @@ export const DEFAULT_WEIGHTS: ModelWeights = {
   yardageRank: 40,
   specialTeams: 35,
   situationalSweep: 40,
+  possession: 40,
   reasoning: 80,
 };
 
@@ -445,21 +506,51 @@ export function yardageRankScore(rank: YardageRank | undefined): number {
 
 const isSidelined = (status: string) => /out|reserve|\bir\b|doubtful/i.test(status);
 
+function normalizeName(name: string): string {
+  return name.toLowerCase().replace(/[.'’]/g, "").replace(/\s+/g, " ").trim();
+}
+
+/** True if an injured player and a roster entry are (probably) the same
+ *  person — id match when both sides have one, normalized full-name match
+ *  otherwise, falling back to a last-name match as a last resort. */
+function samePlayer(injured: InjuredPlayer, roster: RosterPlayer): boolean {
+  if (injured.id && roster.id) return injured.id === roster.id;
+  const a = normalizeName(injured.name);
+  const b = normalizeName(roster.name);
+  if (a === b) return true;
+  const aLast = a.split(" ").pop();
+  const bLast = b.split(" ").pop();
+  return !!aLast && aLast === bLast;
+}
+
 /**
  * When a team's RB is out (or doubtful), the offense's plan shifts: pass
  * volume goes up, and the backup RB is assumed less effective than the
  * starter. The shift matters more for a team that already leans on the
  * run (losing what you depend on hurts more than losing a complementary
- * piece). Returns a same-team offense-strength adjustment — 0 or negative.
+ * piece) — and matters far less if the hurt player wasn't the presumptive
+ * starter to begin with (see TeamRoster's doc comment on that heuristic).
+ * Without roster data, falls back to treating any RB injury as if it were
+ * the starter — the original, less precise behavior. Returns a same-team
+ * offense-strength adjustment — 0 or negative.
  */
-export function usageShiftEdge(injuries: TeamInjuryReport | undefined, profile: StyleProfile): number {
+export function usageShiftEdge(
+  injuries: TeamInjuryReport | undefined,
+  profile: StyleProfile,
+  roster?: TeamRoster,
+): number {
   if (!injuries) return 0;
   const rbHurt = injuries.players.find((p) => p.position === "RB" && isSidelined(p.status));
   if (!rbHurt) return 0;
   const severity = /doubtful/i.test(rbHurt.status) ? 0.5 : 1;
   const dependence =
     profile.offense === "Run-heavy" ? 1 : profile.offense === "Balanced" ? 0.6 : 0.3;
-  return -severity * dependence * 0.5;
+  let starterMultiplier = 1;
+  if (roster) {
+    const starter = presumptiveStarter(roster, "RB");
+    starterMultiplier = starter && samePlayer(rbHurt, starter) ? 1 : 0.35;
+  }
+  return -severity * dependence * starterMultiplier * 0.5;
 }
 
 /* ─── Special teams ────────────────────────────────────── */
@@ -476,6 +567,39 @@ export function specialTeamsScore(detail?: TeamDetailStats): number {
   if (detail.puntReturnAvg != null) score += clamp((detail.puntReturnAvg - 8) / 7, -0.5, 0.5);
   if (detail.kickReturnAvg != null) score += clamp((detail.kickReturnAvg - 21) / 6, -0.5, 0.5);
   if (detail.specialTeamsTDs) score += Math.min(detail.specialTeamsTDs * 0.4, 0.6);
+  return score;
+}
+
+/* ─── Time of possession, weighed against the ability to score ── */
+
+/**
+ * Control matters, but only paired with the ability to score with it —
+ * and its inverse: a team that holds the ball *less* needs to make its
+ * possessions count (efficient scoring) and get stops on defense when it
+ * matters, or the raw TOP disadvantage just compounds.
+ *
+ * - `topPct`: time of possession as a percent of the game (50 = even).
+ * - `yardsPerPoint`: lower is more efficient (fewer yards needed per
+ *   point scored) — the same metric already used in the Production
+ *   factor, reused here rather than recomputed.
+ * - `defenseTier`: from styleProfile() — matters more when topPct is
+ *   below even, since that team's defense has to make up the difference.
+ */
+export function possessionQualityScore(
+  topPct: number | null | undefined,
+  yardsPerPoint: number | null | undefined,
+  defenseTier: DefenseTier | null | undefined,
+): number {
+  if (topPct == null) return 0;
+  const controlEdge = clamp((topPct - 50) / 15, -1, 1);
+  // League-typical is ~15 yd/pt; an efficient offense amplifies the value
+  // of the possessions it does get, an inefficient one dampens it.
+  const efficiencyMult = yardsPerPoint != null ? clamp(15 / yardsPerPoint, 0.6, 1.4) : 1;
+  let score = controlEdge * efficiencyMult;
+  if (controlEdge < 0) {
+    if (defenseTier === "Stingy") score += 0.15; // clutch stops compensate for fewer snaps
+    else if (defenseTier === "Leaky") score -= 0.1; // fewer snaps *and* can't get stops — compounds
+  }
   return score;
 }
 
@@ -572,6 +696,8 @@ export function predictGame(
   const ai = ctx.injuries?.[game.away.id];
   const hAdv = ctx.advanced?.[normalizeAbbr(game.home.abbreviation)];
   const aAdv = ctx.advanced?.[normalizeAbbr(game.away.abbreviation)];
+  const hRoster = ctx.rosters?.[game.home.id];
+  const aRoster = ctx.rosters?.[game.away.id];
 
   const contributions: { label: string; value: number }[] = [];
   const add = (label: string, rawEdge: number, weight: number) => {
@@ -679,7 +805,7 @@ export function predictGame(
   // Game-plan usage shift: a hurt RB pushes the offense toward more
   // passing and a less-effective run game, worse for teams that lean on
   // the run in the first place.
-  const usageEdge = usageShiftEdge(hi, hProf) - usageShiftEdge(ai, aProf);
+  const usageEdge = usageShiftEdge(hi, hProf, hRoster) - usageShiftEdge(ai, aProf, aRoster);
   edge += add("Usage shift", usageEdge, weights.usageShift);
 
   // 3rd / 4th down conversion rate — 4th down is the more critical
@@ -725,6 +851,13 @@ export function predictGame(
   const sweepEdge = situationalSweepBonus(situationalCategoryWinners(h, a, hd, ad));
   edge += add("Situational sweep", sweepEdge, weights.situationalSweep);
 
+  // Time of possession, weighed against the ability to actually score with
+  // it (and, for the team with less of it, the ability to get stops).
+  const possessionEdge =
+    possessionQualityScore(hd?.possessionPct, hYpp, hProf.defenseTier) -
+    possessionQualityScore(ad?.possessionPct, aYpp, aProf.defenseTier);
+  edge += add("Time of possession", possessionEdge, weights.possession);
+
   // The user's reasoning layer: lean slider + environment tags.
   const tagSum = Object.values(input.tags).reduce(
     (sum, side) => sum + (side === "home" ? 0.35 : -0.35),
@@ -746,6 +879,41 @@ export function predictGame(
 
 /* ─── Live win probability (the comeback curve) ───────── */
 
+/** Elapsed game seconds from kickoff, for comparing "when" across plays. */
+function elapsedGameSeconds(period: number, clockSeconds: number): number {
+  const p = clamp(period, 1, 4);
+  return (p - 1) * 900 + (900 - clamp(clockSeconds, 0, 900));
+}
+
+const MOMENTUM_DECAY_SECONDS = 300; // a big play's extra juice fades over ~5 game-minutes
+const MOMENTUM_MAX_SHIFT = 0.06; // probability shift immediately after the play
+const MOMENTUM_CAP = 0.15; // several explosive plays close together can stack, but not without limit
+
+/**
+ * Extra probability shift from recent "explosive" plays — a pick-six, a
+ * fumble/punt/kick return TD, a blocked-kick return — the ones that swing
+ * momentum beyond their point value (which the score/clock curve already
+ * covers). Decays linearly to 0 over ~5 game-minutes; stacks (capped) if
+ * multiple such plays landed close together.
+ */
+export function momentumBump(
+  scoringPlays: ScoringPlay[] | undefined,
+  period: number,
+  clockSeconds: number,
+): number {
+  if (!scoringPlays || scoringPlays.length === 0) return 0;
+  const nowElapsed = elapsedGameSeconds(period, clockSeconds);
+  let bump = 0;
+  for (const play of scoringPlays) {
+    if (!play.explosive) continue;
+    const since = nowElapsed - elapsedGameSeconds(play.period, play.clockSeconds);
+    if (since < 0 || since > MOMENTUM_DECAY_SECONDS) continue;
+    const strength = MOMENTUM_MAX_SHIFT * (1 - since / MOMENTUM_DECAY_SECONDS);
+    bump += play.team === "home" ? strength : -strength;
+  }
+  return clamp(bump, -MOMENTUM_CAP, MOMENTUM_CAP);
+}
+
 /**
  * Reprice the pregame edge by score and clock for an in-progress game.
  *
@@ -753,7 +921,9 @@ export function predictGame(
  * sd ≈ 13.5 points over a full game, shrinking with √(time remaining).
  * Down 21-0 in Q1 that leaves a real few-percent chance; the same deficit
  * midway through Q4 is effectively zero — matching how comebacks actually
- * happen "all the way to the 4th".
+ * happen "all the way to the 4th". On top of that, a recent explosive
+ * defensive/special-teams score adds its own short-lived momentum bump —
+ * see momentumBump().
  */
 export function liveWinProb(game: Game, pregameHomeProb: number): number {
   if (game.completed) {
@@ -776,7 +946,9 @@ export function liveWinProb(game: Game, pregameHomeProb: number): number {
   const p = clamp(pregameHomeProb, 0.02, 0.98);
   const spread = 7.6 * Math.log(p / (1 - p));
   const sd = 13.5 * Math.sqrt(t);
-  return clamp(normCdf((margin + spread * t) / sd), 0.001, 0.999);
+  const base = normCdf((margin + spread * t) / sd);
+  const bump = momentumBump(game.scoringPlays, period, clock);
+  return clamp(base + bump, 0.001, 0.999);
 }
 
 /* ─── ESPN fetch + parse ──────────────────────────────── */
@@ -863,6 +1035,71 @@ export async function fetchWeek(season?: number, week?: number): Promise<WeekSch
   return parseScoreboard(data);
 }
 
+/**
+ * Detects an "explosive" (defensive/special-teams) score from a scoring
+ * play's description text — the most stable signal across ESPN's summary
+ * payload shape, since structured type/category fields for this drift more
+ * than the natural-language play text does. Exported for tests.
+ */
+export function isExplosiveScoringPlay(text: string): boolean {
+  return /interception return|int return|pick.?six|fumble return|fumble recovery.*(touchdown|td)|punt return.*(touchdown|td)|kickoff return.*(touchdown|td)|kick return.*(touchdown|td)|blocked (punt|field goal|kick)/i.test(
+    text,
+  );
+}
+
+/**
+ * Parse an ESPN game-summary payload's scoring plays into the minimal
+ * shape liveWinProb's momentum bump needs. Best-effort against a payload
+ * shape that couldn't be verified live from this environment — every
+ * field is read defensively, and a play that can't be resolved to a
+ * period/clock/team is simply dropped rather than guessed at. Exported for
+ * tests.
+ */
+export function parseScoringPlays(data: any, homeTeamId: string, awayTeamId: string): ScoringPlay[] {
+  const raw: any[] = Array.isArray(data?.scoringPlays) ? data.scoringPlays : [];
+  const plays: ScoringPlay[] = [];
+  for (const p of raw) {
+    const teamId = String(p?.team?.id ?? "");
+    const team: "home" | "away" | null =
+      teamId === homeTeamId ? "home" : teamId === awayTeamId ? "away" : null;
+    if (!team) continue;
+    const period = Number(p?.period?.number ?? p?.period ?? NaN);
+    if (!Number.isFinite(period)) continue;
+    let clockSeconds: number | null = null;
+    if (typeof p?.clock?.value === "number") {
+      clockSeconds = p.clock.value;
+    } else if (typeof p?.clock?.displayValue === "string" && /^\d+:\d{2}$/.test(p.clock.displayValue)) {
+      const [m, s] = p.clock.displayValue.split(":").map(Number);
+      clockSeconds = m * 60 + s;
+    }
+    if (clockSeconds == null) continue;
+    const text = String(p?.text ?? p?.shortText ?? "");
+    plays.push({ period, clockSeconds, team, explosive: isExplosiveScoringPlay(text) });
+  }
+  return plays;
+}
+
+/**
+ * Fetch scoring plays for one live game. Failures return an empty list
+ * (liveWinProb treats that as "no momentum data" and just uses the
+ * score/clock curve) rather than throwing — a live-game detail feed
+ * hiccuping shouldn't take down the rest of the page.
+ */
+export async function fetchScoringPlays(
+  gameId: string,
+  homeTeamId: string,
+  awayTeamId: string,
+): Promise<ScoringPlay[]> {
+  try {
+    const data = await fetchJson(
+      `${ESPN_SITE}/site/v2/sports/football/nfl/summary?event=${gameId}`,
+    );
+    return parseScoringPlays(data, homeTeamId, awayTeamId);
+  } catch {
+    return [];
+  }
+}
+
 /** Parse a standings payload into a per-team stats map. Exported for tests. */
 export function parseStandings(data: any): StatsMap {
   const map: StatsMap = {};
@@ -928,22 +1165,33 @@ export function parseTeamStatistics(teamId: string, data: any): TeamDetailStats 
   let offInterceptionsThrown = 0;
   let offFumblesLost = 0;
   let turnoverDifferential: number | null = null;
+  let possessionSeconds: number | null = null;
 
   for (const cat of data?.splits?.categories ?? []) {
     const catName = String(cat?.name ?? "").toLowerCase();
     const isDefense = catName.includes("defensive") || catName.includes("defense");
     for (const s of cat?.stats ?? []) {
-      if (!s?.name || typeof s.value !== "number") continue;
-      if (!(s.name in idx)) idx[s.name] = s.value;
-      if (s.name === "interceptions") {
+      if (!s?.name) continue;
+      if (typeof s.value === "number" && !(s.name in idx)) idx[s.name] = s.value;
+      if (s.name === "interceptions" && typeof s.value === "number") {
         if (isDefense) defInterceptions = s.value;
         else offInterceptionsThrown = s.value;
-      } else if (s.name === "fumblesRecovered") {
+      } else if (s.name === "fumblesRecovered" && typeof s.value === "number") {
         defFumbleRecoveries = s.value;
-      } else if (s.name === "fumblesLost") {
+      } else if (s.name === "fumblesLost" && typeof s.value === "number") {
         offFumblesLost = s.value;
-      } else if (s.name === "turnOverDifferential" && turnoverDifferential == null) {
+      } else if (s.name === "turnOverDifferential" && typeof s.value === "number" && turnoverDifferential == null) {
         turnoverDifferential = s.value;
+      } else if (
+        possessionSeconds == null &&
+        /possessionTime|timeOfPossession/i.test(s.name)
+      ) {
+        if (typeof s.value === "number") {
+          possessionSeconds = s.value;
+        } else if (typeof s.displayValue === "string" && /^\d+:\d{2}$/.test(s.displayValue)) {
+          const [m, sec] = s.displayValue.split(":").map(Number);
+          possessionSeconds = m * 60 + sec;
+        }
       }
     }
   }
@@ -979,6 +1227,9 @@ export function parseTeamStatistics(teamId: string, data: any): TeamDetailStats 
     (kickReturns && kickReturnYards != null ? kickReturnYards / kickReturns : null);
   const specialTeamsTDs =
     (idx.puntReturnTouchdowns ?? 0) + (idx.kickReturnTouchdowns ?? 0) || null;
+  // Percent of a 60-minute (3600s) regulation game — overtime possessions
+  // are a rounding error against a season average, not worth adjusting for.
+  const possessionPct = possessionSeconds != null ? (possessionSeconds / 3600) * 100 : null;
 
   return {
     teamId,
@@ -993,6 +1244,7 @@ export function parseTeamStatistics(teamId: string, data: any): TeamDetailStats 
     puntReturnAvg,
     kickReturnAvg,
     specialTeamsTDs,
+    possessionPct,
   };
 }
 
@@ -1039,7 +1291,8 @@ export function parseInjuries(data: any): InjuryMap {
       const status = inj?.status ?? inj?.type?.description ?? "";
       if (!name || !status) continue;
       const position = inj?.athlete?.position?.abbreviation ?? "";
-      players.push({ name, position, status });
+      const id = inj?.athlete?.id != null ? String(inj.athlete.id) : undefined;
+      players.push({ id, name, position, status });
       burden += statusWeight(status) * posWeight(position);
     }
     // Worst news first: QBs and harder statuses at the top of the list.
@@ -1054,6 +1307,51 @@ export function parseInjuries(data: any): InjuryMap {
 export async function fetchInjuries(): Promise<InjuryMap> {
   const data = await fetchJson(`${ESPN_SITE}/site/v2/sports/football/nfl/injuries`);
   return parseInjuries(data);
+}
+
+/**
+ * Parse a team roster payload into position-grouped players with a
+ * best-effort depth order (see TeamRoster's doc comment on the
+ * "presumptive starter" heuristic). Tolerates both the grouped
+ * `{ athletes: [{ items: [...] }] }` shape and a flatter `{ athletes: [...] }`
+ * list, since ESPN has served both over time. Exported for tests.
+ */
+export function parseRoster(teamId: string, data: any): TeamRoster {
+  const rawGroups: any[] = Array.isArray(data?.athletes) ? data.athletes : [];
+  const rawPlayers: any[] = rawGroups.length > 0 && rawGroups[0]?.items
+    ? rawGroups.flatMap((g) => g?.items ?? [])
+    : rawGroups;
+
+  const depthByPosition: Record<string, number> = {};
+  const players: RosterPlayer[] = [];
+  for (const p of rawPlayers) {
+    const id = p?.id != null ? String(p.id) : undefined;
+    const name = p?.displayName ?? p?.fullName ?? p?.shortName;
+    const position = p?.position?.abbreviation ?? p?.position?.name;
+    if (!id || !name || !position) continue;
+    const depthIndex = depthByPosition[position] ?? 0;
+    depthByPosition[position] = depthIndex + 1;
+    players.push({ id, name, position, depthIndex });
+  }
+  return { teamId, players };
+}
+
+export async function fetchRoster(season: number, teamId: string): Promise<TeamRoster> {
+  const data = await fetchJson(
+    `${ESPN_SITE}/site/v2/sports/football/nfl/seasons/${season}/teams/${teamId}/roster`,
+  );
+  return parseRoster(teamId, data);
+}
+
+/** Fetch every team's roster; a team whose fetch fails just has no entry
+ *  (usageShiftEdge degrades to its pre-roster, less-precise behavior). */
+export async function fetchRosterMap(season: number, teamIds: string[]): Promise<RosterMap> {
+  const results = await Promise.allSettled(teamIds.map((id) => fetchRoster(season, id)));
+  const map: RosterMap = {};
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled" && r.value.players.length > 0) map[teamIds[i]] = r.value;
+  });
+  return map;
 }
 
 /* eslint-enable @typescript-eslint/no-explicit-any */

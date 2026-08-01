@@ -6,15 +6,21 @@ import {
   computeFlowStats,
   computeYardageRanks,
   ensureWeights,
+  isExplosiveScoringPlay,
   normalizeAbbr,
   gradeGame,
   groupByDay,
   liveWinProb,
+  momentumBump,
   parseInjuries,
+  parseRoster,
   parseScoreboard,
+  parseScoringPlays,
   parseStandings,
   parseTeamStatistics,
+  possessionQualityScore,
   predictGame,
+  presumptiveStarter,
   pythagoreanWinPct,
   specialTeamsScore,
   situationalCategoryWinners,
@@ -26,9 +32,11 @@ import {
   yardageRankScore,
   type Game,
   type GameContext,
+  type ScoringPlay,
   type StatsMap,
   type TeamDetailStats,
   type TeamInjuryReport,
+  type TeamRoster,
   type TeamSeasonStats,
 } from "@/lib/predictor";
 
@@ -102,7 +110,7 @@ describe("predictGame", () => {
     expect(p.confidence).toBeGreaterThanOrEqual(0.5);
   });
 
-  it("reports per-factor contributions for all twenty factors", () => {
+  it("reports per-factor contributions for all twenty-one factors", () => {
     const p = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS, EMPTY_INPUT);
     expect(p.contributions.map((c) => c.label)).toEqual([
       "Record",
@@ -124,6 +132,7 @@ describe("predictGame", () => {
       "Yardage rank",
       "Special teams",
       "Situational sweep",
+      "Time of possession",
       "Your reasoning",
     ]);
   });
@@ -342,6 +351,50 @@ describe("predictGame", () => {
     expect(sweepContribution.value).toBeGreaterThan(0);
     expect(withSweep.homeProb).toBeGreaterThan(withoutSweep.homeProb);
   });
+
+  it("favors the team with better time-of-possession quality", () => {
+    const ctx: GameContext = {
+      ...evenCtx(),
+      detail: {
+        "1": { teamId: "1", passYpg: null, rushYpg: null, totalYpg: null, possessionPct: 58 },
+        "2": { teamId: "2", passYpg: null, rushYpg: null, totalYpg: null, possessionPct: 42 },
+      },
+    };
+    const base = predictGame(matchup, evenCtx(), DEFAULT_WEIGHTS);
+    const withTop = predictGame(matchup, ctx, DEFAULT_WEIGHTS);
+    expect(withTop.homeProb).toBeGreaterThan(base.homeProb);
+  });
+
+  it("uses roster data to dock a hurt starter RB more than a hurt backup would be docked", () => {
+    const detail = {
+      "1": { teamId: "1", passYpg: 100, rushYpg: 160, totalYpg: 260 }, // run-heavy
+      "2": { teamId: "2", passYpg: 100, rushYpg: 160, totalYpg: 260 },
+    };
+    const roster = {
+      "1": {
+        teamId: "1",
+        players: [
+          { id: "100", name: "Star RB", position: "RB", depthIndex: 0 },
+          { id: "101", name: "Backup RB", position: "RB", depthIndex: 1 },
+        ],
+      },
+    };
+    const starterHurtCtx: GameContext = {
+      ...evenCtx(),
+      detail,
+      rosters: roster,
+      injuries: { "1": { teamId: "1", burden: 5, players: [{ id: "100", name: "Star RB", position: "RB", status: "Out" }] } },
+    };
+    const backupHurtCtx: GameContext = {
+      ...evenCtx(),
+      detail,
+      rosters: roster,
+      injuries: { "1": { teamId: "1", burden: 5, players: [{ id: "101", name: "Backup RB", position: "RB", status: "Out" }] } },
+    };
+    const starterHurt = predictGame(matchup, starterHurtCtx, DEFAULT_WEIGHTS);
+    const backupHurt = predictGame(matchup, backupHurtCtx, DEFAULT_WEIGHTS);
+    expect(starterHurt.homeProb).toBeLessThan(backupHurt.homeProb);
+  });
 });
 
 describe("liveWinProb (the comeback curve)", () => {
@@ -385,6 +438,16 @@ describe("liveWinProb (the comeback curve)", () => {
   it("returns the pregame probability for games that haven't started", () => {
     const pre: Game = { ...liveGame(1, 900, 0, 0), state: "pre", homeScore: undefined, awayScore: undefined };
     expect(liveWinProb(pre, 0.63)).toBe(0.63);
+  });
+
+  it("bumps the live probability after a recent explosive away-team play, even at the same score", () => {
+    const tied = liveGame(2, 500, 14, 14);
+    const withoutMomentum = liveWinProb(tied, 0.5);
+    const withMomentum = liveWinProb(
+      { ...tied, scoringPlays: [{ period: 2, clockSeconds: 550, team: "away", explosive: true }] },
+      0.5,
+    );
+    expect(withMomentum).toBeLessThan(withoutMomentum);
   });
 
   it("resolves to certainty when the game is complete", () => {
@@ -684,6 +747,257 @@ describe("usageShiftEdge", () => {
 
   it("returns 0 with no injury report", () => {
     expect(usageShiftEdge(undefined, runHeavy)).toBe(0);
+  });
+
+  function mkRoster(players: TeamRoster["players"]): TeamRoster {
+    return { teamId: "1", players };
+  }
+
+  it("applies the full penalty when the hurt RB is the roster's presumptive starter", () => {
+    const injuries = mkInjuries([{ id: "100", name: "Star RB", position: "RB", status: "Out" }]);
+    const roster = mkRoster([
+      { id: "100", name: "Star RB", position: "RB", depthIndex: 0 },
+      { id: "101", name: "Backup RB", position: "RB", depthIndex: 1 },
+    ]);
+    const withRoster = usageShiftEdge(injuries, runHeavy, roster);
+    const withoutRoster = usageShiftEdge(injuries, runHeavy);
+    expect(withRoster).toBeCloseTo(withoutRoster, 10); // starter confirmed — same as the no-roster assumption
+  });
+
+  it("applies a much smaller penalty when the hurt RB is a backup, not the starter", () => {
+    const injuries = mkInjuries([{ id: "101", name: "Backup RB", position: "RB", status: "Out" }]);
+    const roster = mkRoster([
+      { id: "100", name: "Star RB", position: "RB", depthIndex: 0 },
+      { id: "101", name: "Backup RB", position: "RB", depthIndex: 1 },
+    ]);
+    const backupHurt = usageShiftEdge(injuries, runHeavy, roster);
+    const starterHurt = usageShiftEdge(
+      mkInjuries([{ id: "100", name: "Star RB", position: "RB", status: "Out" }]),
+      runHeavy,
+      roster,
+    );
+    expect(backupHurt).toBeLessThan(0);
+    expect(Math.abs(backupHurt)).toBeLessThan(Math.abs(starterHurt));
+  });
+
+  it("matches by normalized name when ids aren't available on either side", () => {
+    const injuries = mkInjuries([{ name: "A.J. O'Brien Jr.", position: "RB", status: "Out" }]);
+    const roster = mkRoster([{ id: "9", name: "AJ OBrien Jr", position: "RB", depthIndex: 0 }]);
+    const edge = usageShiftEdge(injuries, runHeavy, roster);
+    expect(edge).toBeLessThan(0);
+    // Should match as strongly as the exact-match case (full starter penalty).
+    expect(edge).toBeCloseTo(usageShiftEdge(injuries, runHeavy), 10);
+  });
+});
+
+describe("presumptiveStarter", () => {
+  it("returns the depthIndex-0 player at a position", () => {
+    const roster: TeamRoster = {
+      teamId: "1",
+      players: [
+        { id: "1", name: "Backup", position: "RB", depthIndex: 1 },
+        { id: "2", name: "Starter", position: "RB", depthIndex: 0 },
+      ],
+    };
+    expect(presumptiveStarter(roster, "RB")?.name).toBe("Starter");
+  });
+
+  it("returns null when the position isn't on the roster, or there's no roster", () => {
+    const roster: TeamRoster = { teamId: "1", players: [] };
+    expect(presumptiveStarter(roster, "RB")).toBeNull();
+    expect(presumptiveStarter(undefined, "RB")).toBeNull();
+  });
+});
+
+describe("parseRoster", () => {
+  it("parses the grouped { athletes: [{ items }] } shape and assigns depth order", () => {
+    const roster = parseRoster("12", {
+      athletes: [
+        {
+          position: "offense",
+          items: [
+            { id: "1", displayName: "Star QB", position: { abbreviation: "QB" } },
+            { id: "2", displayName: "RB1", position: { abbreviation: "RB" } },
+            { id: "3", displayName: "RB2", position: { abbreviation: "RB" } },
+          ],
+        },
+      ],
+    });
+    expect(roster.players).toHaveLength(3);
+    const rb1 = roster.players.find((p) => p.id === "2")!;
+    const rb2 = roster.players.find((p) => p.id === "3")!;
+    expect(rb1.depthIndex).toBe(0);
+    expect(rb2.depthIndex).toBe(1);
+  });
+
+  it("parses a flat { athletes: [...] } shape too", () => {
+    const roster = parseRoster("12", {
+      athletes: [{ id: "1", displayName: "Player", position: { abbreviation: "WR" } }],
+    });
+    expect(roster.players).toEqual([{ id: "1", name: "Player", position: "WR", depthIndex: 0 }]);
+  });
+
+  it("skips players missing an id, name, or position rather than crashing", () => {
+    const roster = parseRoster("12", {
+      athletes: [
+        { id: "1", displayName: "Has everything", position: { abbreviation: "QB" } },
+        { id: "2", position: { abbreviation: "QB" } }, // no name
+        { displayName: "No id", position: { abbreviation: "QB" } },
+      ],
+    });
+    expect(roster.players).toHaveLength(1);
+  });
+
+  it("tolerates empty/malformed payloads", () => {
+    expect(parseRoster("12", {}).players).toEqual([]);
+    expect(parseRoster("12", null).players).toEqual([]);
+  });
+});
+
+describe("possessionQualityScore", () => {
+  it("returns 0 when possession data is missing", () => {
+    expect(possessionQualityScore(null, null, null)).toBe(0);
+    expect(possessionQualityScore(undefined, 15, "Solid")).toBe(0);
+  });
+
+  it("credits raw control, but amplifies it for an efficient offense", () => {
+    const inefficient = possessionQualityScore(55, 20, "Solid"); // 20 yd/pt — worse than league-typical
+    const efficient = possessionQualityScore(55, 10, "Solid"); // 10 yd/pt — better than league-typical
+    expect(efficient).toBeGreaterThan(inefficient);
+    expect(inefficient).toBeGreaterThan(0); // still positive — control has some value regardless
+  });
+
+  it("rewards a stingy defense compensating for below-average possession time", () => {
+    const withStingyD = possessionQualityScore(42, 15, "Stingy");
+    const withSolidD = possessionQualityScore(42, 15, "Solid");
+    const withLeakyD = possessionQualityScore(42, 15, "Leaky");
+    expect(withStingyD).toBeGreaterThan(withSolidD);
+    expect(withLeakyD).toBeLessThan(withSolidD); // low TOP + bad D compounds
+  });
+
+  it("does not apply the low-TOP defense adjustment when possession is above even", () => {
+    const stingy = possessionQualityScore(58, 15, "Stingy");
+    const leaky = possessionQualityScore(58, 15, "Leaky");
+    // Only the defense tier differs, but neither should get the
+    // below-even compensation/penalty since this team controls the ball more.
+    expect(stingy).toBeCloseTo(leaky, 10);
+  });
+});
+
+describe("isExplosiveScoringPlay", () => {
+  it("recognizes defensive and special-teams touchdowns", () => {
+    expect(isExplosiveScoringPlay("Jones 42 Yd Interception Return (Kick failed)")).toBe(true);
+    expect(isExplosiveScoringPlay("Smith 80 Yd Fumble Return Touchdown")).toBe(true);
+    expect(isExplosiveScoringPlay("Davis 65 Yd Punt Return Touchdown")).toBe(true);
+    expect(isExplosiveScoringPlay("Lee 98 Yd Kickoff Return Touchdown")).toBe(true);
+    expect(isExplosiveScoringPlay("Blocked Field Goal recovered in end zone")).toBe(true);
+  });
+
+  it("does not flag an ordinary offensive scoring play", () => {
+    expect(isExplosiveScoringPlay("Mahomes 12 Yd pass to Kelce for a TD")).toBe(false);
+    expect(isExplosiveScoringPlay("Henry 3 Yd Run (Butker Kick)")).toBe(false);
+    expect(isExplosiveScoringPlay("Butker 45 Yd Field Goal")).toBe(false);
+  });
+});
+
+describe("parseScoringPlays", () => {
+  it("resolves each play to home/away and reads clock from a numeric value or MM:SS display", () => {
+    const plays = parseScoringPlays(
+      {
+        scoringPlays: [
+          {
+            team: { id: "12" },
+            period: { number: 2 },
+            clock: { value: 435 },
+            text: "Mahomes pass for a TD",
+          },
+          {
+            team: { id: "13" },
+            period: { number: 3 },
+            clock: { displayValue: "9:20" },
+            text: "Interception Return Touchdown",
+          },
+        ],
+      },
+      "12",
+      "13",
+    );
+    expect(plays).toEqual([
+      { period: 2, clockSeconds: 435, team: "home", explosive: false },
+      { period: 3, clockSeconds: 560, team: "away", explosive: true },
+    ]);
+  });
+
+  it("drops plays it can't resolve a team, period, or clock for", () => {
+    const plays = parseScoringPlays(
+      {
+        scoringPlays: [
+          { team: { id: "99" }, period: { number: 1 }, clock: { value: 100 }, text: "x" }, // unknown team
+          { team: { id: "12" }, clock: { value: 100 }, text: "x" }, // no period
+          { team: { id: "12" }, period: { number: 1 }, text: "x" }, // no clock
+        ],
+      },
+      "12",
+      "13",
+    );
+    expect(plays).toEqual([]);
+  });
+
+  it("tolerates empty/malformed payloads", () => {
+    expect(parseScoringPlays({}, "12", "13")).toEqual([]);
+    expect(parseScoringPlays(null, "12", "13")).toEqual([]);
+  });
+});
+
+describe("momentumBump", () => {
+  const explosivePlay = (period: number, clockSeconds: number, team: "home" | "away"): ScoringPlay => ({
+    period,
+    clockSeconds,
+    team,
+    explosive: true,
+  });
+
+  it("gives a fresh explosive play the maximum bump", () => {
+    // Play at Q2, 10:00 remaining; "now" is the same instant.
+    const bump = momentumBump([explosivePlay(2, 600, "home")], 2, 600);
+    expect(bump).toBeCloseTo(0.06, 5);
+  });
+
+  it("decays linearly to 0 over 5 game-minutes", () => {
+    const play = explosivePlay(2, 600, "home");
+    const at0 = momentumBump([play], 2, 600);
+    const at150s = momentumBump([play], 2, 450); // 150s of game clock later
+    const at300s = momentumBump([play], 2, 300); // 300s later — fully decayed
+    const at600s = momentumBump([play], 3, 900); // well past decay window
+    expect(at150s).toBeLessThan(at0);
+    expect(at150s).toBeGreaterThan(0);
+    expect(at300s).toBeCloseTo(0, 5);
+    expect(at600s).toBe(0);
+  });
+
+  it("is negative for an away-team explosive play, and ignores non-explosive scores", () => {
+    const awayBump = momentumBump([explosivePlay(2, 600, "away")], 2, 600);
+    expect(awayBump).toBeLessThan(0);
+    const ordinary = momentumBump([{ period: 2, clockSeconds: 600, team: "home", explosive: false }], 2, 600);
+    expect(ordinary).toBe(0);
+  });
+
+  it("ignores a play that hasn't happened yet from the current clock's perspective", () => {
+    // Play logged at Q3 (later) while "now" is Q1 (earlier) shouldn't apply.
+    const bump = momentumBump([explosivePlay(3, 600, "home")], 1, 600);
+    expect(bump).toBe(0);
+  });
+
+  it("stacks multiple recent explosive plays but caps the total", () => {
+    const plays = [explosivePlay(2, 700, "home"), explosivePlay(2, 650, "home"), explosivePlay(2, 600, "home")];
+    const bump = momentumBump(plays, 2, 600);
+    expect(bump).toBeLessThanOrEqual(0.15);
+    expect(bump).toBeGreaterThan(0.06); // more than a single play's max
+  });
+
+  it("returns 0 with no scoring plays", () => {
+    expect(momentumBump(undefined, 2, 600)).toBe(0);
+    expect(momentumBump([], 2, 600)).toBe(0);
   });
 });
 

@@ -10,6 +10,8 @@ import {
   ensureWeights,
   fetchDetailMap,
   fetchInjuries,
+  fetchRosterMap,
+  fetchScoringPlays,
   fetchSeasonHistory,
   fetchStandings,
   fetchWeek,
@@ -25,6 +27,7 @@ import {
   type GameContext,
   type GameInput,
   type ModelWeights,
+  type ScoringPlay,
   type TeamFlowStats,
 } from "@/lib/predictor";
 import { ADVANCED_SOURCE_LABELS, fetchAdvancedStats } from "@/lib/advanced";
@@ -46,7 +49,8 @@ const WEIGHT_LABELS: { key: keyof ModelWeights; label: string; hint: string }[] 
   { key: "turnoverMargin", label: "Turnover margin", hint: "Tiered; takeaways count more than giveaways avoided" },
   { key: "specialTeams", label: "Special teams", hint: "Return production + return-TD momentum" },
   { key: "situationalSweep", label: "Situational sweep", hint: "Bonus for winning nearly everything: 3rd down, turnovers, rushing, passing" },
-  { key: "usageShift", label: "Usage shift", hint: "RB injury → pass-heavier game plan" },
+  { key: "usageShift", label: "Usage shift", hint: "RB injury → pass-heavier game plan (roster-aware: starter vs backup)" },
+  { key: "possession", label: "Time of possession", hint: "Control + ability to score; clutch D matters more with less TOP" },
   { key: "flow", label: "Game flow", hint: "1st/2nd-half surges from quarter scoring" },
   { key: "injuries", label: "Injuries", hint: "Injury-report burden, QB-weighted" },
   { key: "style", label: "Style matchup", hint: "Offense type vs defense type" },
@@ -588,6 +592,38 @@ export default function App() {
     retry: 1,
   });
 
+  // Rosters, so usageShift can tell a hurt starter from a hurt backup.
+  const rosters = useQuery({
+    queryKey: ["nfl", "rosters", season, teamIds.join(",")],
+    queryFn: () => fetchRosterMap(season!, teamIds),
+    enabled: season != null && teamIds.length > 0,
+    staleTime: 60 * 60_000, // rosters barely move within a week
+    retry: 1,
+  });
+
+  // Scoring plays for live games only, refetched often so the in-game
+  // momentum bump (see momentumBump()) reflects what just happened.
+  const liveGameIds = useMemo(
+    () => games.filter((g) => g.state === "in").map((g) => g.id),
+    [games],
+  );
+  const scoringPlays = useQuery({
+    queryKey: ["nfl", "scoringPlays", liveGameIds.join(",")],
+    queryFn: async () => {
+      const liveGames = games.filter((g) => g.state === "in");
+      const entries = await Promise.all(
+        liveGames.map(
+          async (g) => [g.id, await fetchScoringPlays(g.id, g.home.id, g.away.id)] as const,
+        ),
+      );
+      return Object.fromEntries(entries) as Record<string, ScoringPlay[]>;
+    },
+    enabled: liveGameIds.length > 0,
+    staleTime: 20_000,
+    refetchInterval: liveGameIds.length > 0 ? 20_000 : false,
+    retry: 1,
+  });
+
   // NOTE: ranks only this week's participants, not the full 32-team
   // league, until detail is fetched for every team (tracked in
   // PROGRESS.md) — a genuine approximation, not a full league rank yet.
@@ -603,13 +639,27 @@ export default function App() {
       flow: history.data?.flow,
       elo: history.data?.elo,
       injuries: injuries.data,
+      rosters: rosters.data,
       advanced: advanced.data?.teams,
       yardageRanks,
     }),
-    [standings.data, detail.data, history.data, injuries.data, advanced.data, yardageRanks],
+    [standings.data, detail.data, history.data, injuries.data, rosters.data, advanced.data, yardageRanks],
   );
 
-  const days = useMemo(() => groupByDay(games), [games]);
+  // Live games get their fetched scoring plays attached so liveWinProb can
+  // price the in-game momentum bump; grading/record calculations below use
+  // the plain `games` list since they don't need this.
+  const renderGames = useMemo(
+    () =>
+      games.map((g) =>
+        g.state === "in" && scoringPlays.data?.[g.id]
+          ? { ...g, scoringPlays: scoringPlays.data[g.id] }
+          : g,
+      ),
+    [games, scoringPlays.data],
+  );
+
+  const days = useMemo(() => groupByDay(renderGames), [renderGames]);
 
   // Lock in grades the first time a game is seen final, so later weight
   // tweaks can't rewrite history.
