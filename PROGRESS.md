@@ -1,10 +1,15 @@
 # NFL Predictor — build roadmap
 
 Standing checklist for the recurring build sessions (fires 3-4x/day until
-end of August). Each firing: pick the next unchecked item, implement it with
-tests, run the full suite, check it off, commit, and attempt a push (falls
-back to a local commit if GitHub access for this repo still isn't
-authorized — see NOTES.md).
+end of August, via a Routine). Each firing: pick the next unchecked item,
+implement it with tests, run the full suite, check it off, commit, and push.
+
+**2026-08-01: repo access + the Routine are both live now.** `git push`
+works — the canonical remote is `https://github.com/trey55aa-dev/NFL-predictor`
+(note the casing; the old `nfl-predictor` URL 301-redirects to it, but set
+your `origin` to the new one directly). Ignore any older note below implying
+push is blocked — that's resolved. Always end a firing with an actual
+`git push`, not just a local commit.
 
 ## Spec (from the user, 2026-07-31)
 
@@ -165,10 +170,9 @@ couldn't be tested here.
 
 ## Notes
 
-- GitHub push access to `trey55aa-dev/nfl-predictor` was not authorized as
-  of 2026-07-31 (add_repo kept returning "requires approval"). Until that
-  clears, work accumulates as local commits in this working copy — check
-  `git log` for what's landed. Once access clears, `git push -u origin main`
-  catches the remote up in one shot.
+- **Resolved 2026-08-01:** GitHub push access is authorized. Remote is
+  `https://github.com/trey55aa-dev/NFL-predictor` (canonical casing — the
+  lowercase URL redirects). Every firing should push for real now, not just
+  commit locally.
 - This project intentionally has zero dependency on alfredassist — do not
   reintroduce imports from `../src` or similar.
